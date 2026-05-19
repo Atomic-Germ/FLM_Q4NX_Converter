@@ -20,6 +20,8 @@ class ModelArch(IntEnum):
     PHI4    = auto()
     GPT_OSS = auto()
     NANBEIGE = auto()
+    QWEN3_MOE  = auto()
+    QWEN35_MOE = auto()
 
 
 ModelArchNames: dict[ModelArch, list[str]] = {
@@ -37,7 +39,9 @@ ModelArchNames: dict[ModelArch, list[str]] = {
     ModelArch.LFM2:    ["lfm2"],
     ModelArch.PHI4:    ["phi3"],
     ModelArch.GPT_OSS: ["gpt-oss"],
-    ModelArch.NANBEIGE: ["nanbeige"]
+    ModelArch.NANBEIGE:   ["nanbeige"],
+    ModelArch.QWEN3_MOE:  ["qwen3moe"],
+    ModelArch.QWEN35_MOE: ["qwen35moe"],
 }
 
 ModelArchConfigs: dict[ModelArch, str] = {
@@ -55,5 +59,7 @@ ModelArchConfigs: dict[ModelArch, str] = {
     ModelArch.LFM2:    "lfm2.json",
     ModelArch.PHI4:    "phi4.json",
     ModelArch.GPT_OSS: "gpt-oss.json",
-    ModelArch.NANBEIGE: "nanbeige.json"
+    ModelArch.NANBEIGE:   "nanbeige.json",
+    ModelArch.QWEN3_MOE:  "qwen3moe.json",
+    ModelArch.QWEN35_MOE: "qwen35moe.json",
 }

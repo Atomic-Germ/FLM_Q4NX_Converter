@@ -15,5 +15,7 @@ from .gemma4 import Gemma4
 from .phi4 import Phi4
 from .gpt_oss import GPTOSS
 from .nanbeige import Nanbeige
+from .qwen3moe import Qwen3Moe
+from .qwen35moe import Qwen35Moe
 
-__all__ = ['Qwen3VL', 'Llama', 'LFM2', 'Qwen3', 'Qwen2', 'Qwen2VL', 'Gemma3', 'Gemma4', 'Phi4', 'GPTOSS', 'Nanbeige', 'Qwen35', 'Qwen35_2B', 'Qwen35_9B', 'Qwen35_08B']
+__all__ = ['Qwen3VL', 'Llama', 'LFM2', 'Qwen3', 'Qwen2', 'Qwen2VL', 'Gemma3', 'Gemma4', 'Phi4', 'GPTOSS', 'Nanbeige', 'Qwen35', 'Qwen35_2B', 'Qwen35_9B', 'Qwen35_08B', 'Qwen3Moe', 'Qwen35Moe']

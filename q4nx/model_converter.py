@@ -824,7 +824,7 @@ class __Q4NX_Converter(ABC):
             vocab[token] = idx
         
         # Determine tokenizer type and create appropriate HuggingFace config
-        if tokenizer_model == "llama" or tokenizer_model == "gpt2":
+        if tokenizer_model == "llama" or tokenizer_model == "gpt2" or tokenizer_model == "granite":
             # BPE tokenizer
             tokenizer_json = {
                 "version": "1.0",

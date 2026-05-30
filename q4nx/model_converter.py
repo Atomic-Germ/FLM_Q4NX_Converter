@@ -1045,6 +1045,25 @@ def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converte
     """
     # Read the architecture from the GGUF file
     reader = GGUFReader(gguf_path)
+
+    # Early gate: check hidden_size against libllama_npu.so supported values
+    _SUPPORTED_HIDDEN_SIZES = (2048, 3072, 4096)
+    _arch_str = next(
+        (str(f.parts[f.data[0]], 'utf-8') for f in reader.fields.values() if f.name == 'general.architecture'),
+        None
+    )
+    _hs_key = f'{_arch_str}.embedding_length' if _arch_str else None
+    _hidden_size = next(
+        (int(list(f.parts[f.data[0]])[0]) for f in reader.fields.values() if f.name == _hs_key),
+        None
+    )
+    if _hidden_size is not None and _hidden_size not in _SUPPORTED_HIDDEN_SIZES:
+        raise ValueError(
+            f"Unsupported hidden_size={_hidden_size} (arch={_arch_str!r}).\n"
+            f"libllama_npu.so only supports hidden_size {_SUPPORTED_HIDDEN_SIZES}.\n"
+            f"Models with other hidden sizes cannot run on the FastFlowLM NPU backend."
+        )
+
     model_arch = get_model_arch_from_gguf(reader,override_model_arch )
     
     # Look up the appropriate converter class

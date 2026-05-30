@@ -9,7 +9,7 @@ import torch
 
 class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
     def __init__(self, gguf_reader: GGUFReader):
-        print("[INFO] Using Qwen35_4B converter")
+        print(f"[INFO] Using {type(self).__name__} converter")
         self.gguf_reader = gguf_reader
         self.gguf_tensors = []
         self.initialize()
@@ -198,14 +198,11 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
 
 
 class Qwen35_2B(Qwen35, model_arch=ModelArch.QWEN35_2B):
-    print("[INFO] Using Qwen35_2B converter")
     pass
 
 
 class Qwen35_08B(Qwen35, model_arch=ModelArch.QWEN35_08B):
-    print("[INFO] Using Qwen35_08B converter")
     pass
 
 class Qwen35_9B(Qwen35, model_arch=ModelArch.QWEN35_9B):
-    print("[INFO] Using Qwen35_9B converter")
     pass

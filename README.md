@@ -5,7 +5,9 @@ A utility for converting GGUF model files into the Q4NX format. This tool suppor
 ## Supported Models
 Based on the configuration, the converter supports several model architectures, including:
 - Gemma 3
+- Gemma 4
 - GPT-OSS
+- Granite 4.1
 - LFM 2
 - LLaMA
 - Phi-4
@@ -105,6 +107,72 @@ python convert.py -i gemma4-2b-mmproj.gguf -o unsloth-gemma4-2b-audio -t audio -
 python convert.py -i model.gguf -o output_folder
 ```
 The converter automatically dequantizes non-Q4_0/Q4_1 weights and re-quantizes them into Q4NX. See the [Converting from Other Quantization Formats](#converting-from-other-quantization-formats) section for details.
+
+## HuggingFace One-Shot: compile.py
+
+`compile.py` is the recommended starting point when you have a HuggingFace repo ID but no local GGUF file yet. It probes the model architecture before downloading anything, so incompatible models are caught immediately with a clear explanation — no multi-gigabyte download wasted.
+
+### What it does
+
+1. **Discovers** all GGUF files in the repo and groups them by quantization.
+2. **Fetches architecture parameters** (`hidden_size`, `vocab_size`, `intermediate_size`, architecture name) from `config.json` on HuggingFace. If none is present in the GGUF repo it automatically falls back to the base model repo, then to a partial download of the GGUF header.
+3. **Pre-checks** the model against the hard NPU constraints:
+   - `hidden_size` must be one of `(2048, 3072, 4096)` — binary constraint in `libllama_npu.so`
+   - `vocab_size` must be divisible by 32 — lm_head tile alignment constraint
+   - `intermediate_size` must be divisible by 32 — FFN tile alignment constraint
+   - Architecture must have a registered converter class
+4. If all checks pass and `--check-only` is not set, **downloads** the best available quantization (preference order: `Q4_1 → Q4_0 → Q8_0`) and **converts** it to Q4NX.
+
+> **Note:** When a GGUF repo contains no `config.json` and no base model link in its card metadata (common for community uploads), architecture parameters may not be available. In that case the pre-check is skipped and the download proceeds — the converter's own gates will still catch hard failures with clear messages.
+
+### Help
+```bash
+python compile.py --help
+```
+
+### Arguments
+
+| Flag | Description |
+|---|---|
+| `-hf REPO_ID` | HuggingFace repo ID (required) |
+| `-o OUTPUT` | Output folder (default: `./<model-name>/`) |
+| `--check-only` | Pre-check only — no download or conversion |
+| `--quant {Q4_1,Q4_0,Q8_0}` | Force a specific quantization instead of auto-selecting |
+| `--keep-gguf` | Keep the downloaded GGUF after conversion |
+
+### Examples
+
+**Check whether a model is convertible (no download):**
+```bash
+python compile.py -hf tencent/Hy-MT2-1.8B-GGUF --check-only
+```
+
+**Download and convert the best available quant:**
+```bash
+python compile.py -hf Qwen/Qwen3-8B-GGUF
+```
+
+**Convert to a specific output folder, force Q8_0, keep the GGUF:**
+```bash
+python compile.py -hf Qwen/Qwen3-8B-GGUF -o ./Qwen3-8B-NPU2/ --quant Q8_0 --keep-gguf
+```
+
+**Example rejection output** (model blocked before any download):
+```
+[RESULT] This model cannot be converted to Q4NX:
+  x vocab_size=120818 is not divisible by 32.
+      The lm_head NPU kernel tiles in rows of 32  (hard tile constraint).
+  x Architecture 'hunyuan_v1_dense' has no registered converter.
+      A new model class would need to be added to FLM_Q4NX_Converter.
+
+[HINT] FastFlowLM NPU Q4NX hard constraints:
+  * vocab_size must be divisible by 32 (universal tile constraint)
+  * intermediate_size must be divisible by 32 (universal tile constraint)
+  * Architecture must have a registered converter
+  * hidden_size constraints vary per architecture's NPU library
+```
+
+---
 
 ## Converting from Other Quantization Formats
 

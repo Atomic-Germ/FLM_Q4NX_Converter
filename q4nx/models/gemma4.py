@@ -53,12 +53,52 @@ class Gemma4(__Q4NX_Converter, model_arch=ModelArch.GEMMA4):
                            'blocks row_block_size H -> blocks H row_block_size',
                            )
         return weight
+
+    def quantize_rowwise_i8_with_scales(self, weight: torch.Tensor, block_size: int = 32):
+        """
+        Quantize a 2D matrix to row-wise blocked int8 with per-block scales.
+        Returns:
+            q_weight: int8 tensor with same shape as input
+            scales:   float32 tensor of shape [rows, cols / block_size]
+        """
+        assert weight.ndim == 2, "Expected a 2D matrix"
+        rows, cols = weight.shape
+        assert cols % block_size == 0, f"Column count {cols} must be divisible by {block_size}"
+
+        w = weight.to(torch.float32)
+        w_blocks = w.reshape(rows, cols // block_size, block_size)
+
+        # Q8-style symmetric quantization with one scale per 32-element block.
+        absmax = w_blocks.abs().amax(dim=2)
+        scales = torch.clamp(absmax / 127.0, min=1e-8)
+
+        q = torch.round(w_blocks / scales.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+        q_weight = q.reshape(rows, cols).contiguous()
+
+        return q_weight, scales.to(torch.float32).contiguous()
         
 
     
     
     def convert(self, q4nx_path: str, weights_type: str = 'language'):
         self.q4nx_tensors = {}
+
+        def to_bf16_tensor(gguf_tensor):
+            """Convert a GGUF tensor to a torch.bfloat16 tensor robustly.
+            Some mmproj tensors do not unpack as a single-element tuple when
+            targeting BF16; fall back to explicit dequantization.
+            """
+            unpacked = gguf_tensor.unpack(GGMLQuantizationType.BF16)
+            if len(unpacked) == 1 and isinstance(unpacked[0], torch.Tensor):
+                weights = unpacked[0]
+                if weights.dtype != torch.bfloat16:
+                    weights = weights.to(torch.bfloat16)
+                return weights
+
+            w = gguf_tensor.dequantize()
+            if isinstance(w, torch.Tensor):
+                return w.contiguous().to(torch.bfloat16)
+            return torch.from_numpy(w).contiguous().to(torch.bfloat16)
 
         if weights_type == "language":
             
@@ -72,13 +112,19 @@ class Gemma4(__Q4NX_Converter, model_arch=ModelArch.GEMMA4):
                     w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
                     w = w * float(self.hidden_size) **0.5
                     w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
-                    self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w
+                    q_weight, scales = self.quantize_rowwise_i8_with_scales(w)
+                    out_name = self.forward_name_map[gguf_tensor.name]
+                    self.q4nx_tensors[out_name] = q_weight
+                    self.q4nx_tensors[f"{out_name}.scale"] = scales
                     continue
                 elif "per_layer_token_embd.weight"  ==  gguf_tensor.name:
                     w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
                     w = w*float(self.embedding_length_per_layer_input)**0.5
                     w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
-                    self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w
+                    q_weight, scales = self.quantize_rowwise_i8_with_scales(w)
+                    out_name = self.forward_name_map[gguf_tensor.name]
+                    self.q4nx_tensors[out_name] = q_weight
+                    self.q4nx_tensors[f"{out_name}.scale"] = scales
                     continue
                 elif "per_layer_model_proj.weight" in gguf_tensor.name:
                     unpacked = gguf_tensor.unpack(self.tensor_q4nx_type_map[gguf_tensor.name])
@@ -109,18 +155,17 @@ class Gemma4(__Q4NX_Converter, model_arch=ModelArch.GEMMA4):
                     continue
                                         
                 elif "inp_gate.weight" in gguf_tensor.name or ".proj.weight" in gguf_tensor.name:
-                    
-                    unpacked = gguf_tensor.unpack(self.tensor_q4nx_type_map[gguf_tensor.name])
-                    
-                    
+                    # These tensors are exported as BF16 in q4nx config. For Q8/Q4 GGUF
+                    # inputs, unpack()[0] is a quantization metadata plane, not the full
+                    # dequantized matrix, so always dequantize explicitly here.
+                    w = gguf_tensor.dequantize()
+
                     if "inp_gate.weight" in gguf_tensor.name or ".proj.weight" in gguf_tensor.name:
                         # dedicate for prefill with vision MM
-                        w_for_prefill = self.vision_mm_weight_rearrange(unpacked[0]).contiguous().to(torch.bfloat16)
-                        self.q4nx_tensors[f"{self.forward_name_map[gguf_tensor.name]}_prefill"] = w_for_prefill                    
-                    
-                    
-                    
-                    w = self.reshape_matrix_to_block_matrix_for_mvm(unpacked[0])
+                        w_for_prefill = self.vision_mm_weight_rearrange(w).contiguous().to(torch.bfloat16)
+                        self.q4nx_tensors[f"{self.forward_name_map[gguf_tensor.name]}_prefill"] = w_for_prefill
+
+                    w = self.reshape_matrix_to_block_matrix_for_mvm(w)
                     w = w.contiguous().to(torch.bfloat16)
                     self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w
                     
@@ -136,21 +181,14 @@ class Gemma4(__Q4NX_Converter, model_arch=ModelArch.GEMMA4):
         elif weights_type == "vision":
             
             for key, gguf_tensor in self.gguf_tensors.items():
-                unpacked = gguf_tensor.unpack(GGMLQuantizationType.BF16)
-                assert len(unpacked) == 1
-                assert type(unpacked[0]) == torch.Tensor, "Vision model tensors"
-
-                
-                weights = unpacked[0]
-                if weights.dtype != torch.bfloat16:
-                    # convert to bfloat16
-                    weights = weights.to(torch.bfloat16)
                 if gguf_tensor.name not in self.forward_name_map:
                     # check is not start with "v"
                     if not gguf_tensor.name.startswith("v"):
                         continue
                     else:
                         raise ValueError(f"Tensor name {gguf_tensor.name} not found in forward_name_map for vision model")
+
+                weights = to_bf16_tensor(gguf_tensor)
                 new_name = self.forward_name_map[gguf_tensor.name]
                 
                 if new_name == "model.vision.embedding_projection.weight":
@@ -190,21 +228,13 @@ class Gemma4(__Q4NX_Converter, model_arch=ModelArch.GEMMA4):
                 
         elif weights_type == "audio":
             for key, gguf_tensor in self.gguf_tensors.items():
-                unpacked = gguf_tensor.unpack(GGMLQuantizationType.BF16)
-                assert len(unpacked) == 1
-                assert type(unpacked[0]) == torch.Tensor, "Audio model tensors"
-
-                
-                weights = unpacked[0]
-                if weights.dtype != torch.bfloat16:
-                    # convert to bfloat16
-                    weights = weights.to(torch.bfloat16)
-                    
                 if gguf_tensor.name not in self.forward_name_map:
                     if not gguf_tensor.name.startswith("a"):
                         continue
                     else:
                         raise ValueError(f"Tensor name {gguf_tensor.name} not found in forward_name_map for audio model")
+
+                weights = to_bf16_tensor(gguf_tensor)
                 new_name = self.forward_name_map[gguf_tensor.name]
 
                 if new_name.endswith("conv_dw.weight"):

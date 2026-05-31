@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -54,8 +55,12 @@ def find_gguf_candidates(repo_id: str) -> dict:
 
     candidates = {}
     for name in gguf_files:
-        # mmproj files are the vision encoder — kept separate from language model GGUFs
-        if Path(name).name.lower().startswith('mmproj'):
+        # mmproj files are the vision/audio encoder bundle — keep separate from language GGUFs.
+        # Repos use multiple naming styles, e.g.:
+        #   mmproj-f16.gguf
+        #   model.mmproj-Q8_0.gguf
+        base = Path(name).name.lower()
+        if base.startswith('mmproj') or '.mmproj' in base or '-mmproj' in base:
             candidates.setdefault('mmproj', []).append(name)
             continue
         name_upper = name.upper()
@@ -244,10 +249,13 @@ def gather_arch_params(repo_id: str, candidates: dict) -> dict:
         hs = text_cfg.get('hidden_size')
         vs = text_cfg.get('vocab_size')
         is_ = text_cfg.get('intermediate_size')
+        ah = text_cfg.get('num_attention_heads')
+        kvh = text_cfg.get('num_key_value_heads')
         layer_types = text_cfg.get('layer_types')
         if hs or vs:
             return dict(arch=arch, hidden_size=hs, vocab_size=vs,
-                        intermediate_size=is_, layer_types=layer_types,
+                        intermediate_size=is_, num_attention_heads=ah,
+                        num_key_value_heads=kvh, layer_types=layer_types,
                         source=f"config.json ({label})")
         return None
 
@@ -419,6 +427,88 @@ def download_gguf(repo_id: str, filename: str, dest_dir: Path) -> Path:
     return Path(local_path)
 
 
+def _read_safetensors_header(model_q4nx_path: Path) -> dict:
+    """Read and parse the SafeTensors JSON header from model.q4nx."""
+    with model_q4nx_path.open('rb') as f:
+        header_len_bytes = f.read(8)
+        if len(header_len_bytes) != 8:
+            raise RuntimeError(f"Invalid q4nx file (missing header length): {model_q4nx_path}")
+        header_len = struct.unpack('<Q', header_len_bytes)[0]
+        if header_len == 0 or header_len > 64 * 1024 * 1024:
+            raise RuntimeError(
+                f"Invalid SafeTensors header length ({header_len}) in {model_q4nx_path}"
+            )
+        header_raw = f.read(header_len)
+        if len(header_raw) != header_len:
+            raise RuntimeError(f"Truncated SafeTensors header in {model_q4nx_path}")
+
+    try:
+        return json.loads(header_raw.decode('utf-8'))
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse SafeTensors header JSON: {e}") from e
+
+
+def _shape_of(header: dict, tensor_name: str) -> list[int]:
+    """Extract a tensor shape from a SafeTensors header entry."""
+    node = header.get(tensor_name)
+    if not isinstance(node, dict):
+        raise RuntimeError(f"Missing tensor in q4nx output: {tensor_name}")
+    shape = node.get('shape')
+    if not isinstance(shape, list) or not all(isinstance(x, int) and x >= 0 for x in shape):
+        raise RuntimeError(f"Invalid shape metadata for tensor: {tensor_name}")
+    return shape
+
+
+def validate_q4nx_output_layout(model_q4nx_path: Path, params: dict):
+    """
+    Validate architecture-specific q4nx tensor layouts after conversion.
+    This catches converter mismatches early with a clear message instead of
+    a runtime crash inside the NPU backend.
+    """
+    arch = str(params.get('arch') or '').lower()
+    hidden_size = params.get('hidden_size')
+    num_attention_heads = params.get('num_attention_heads')
+    num_key_value_heads = params.get('num_key_value_heads')
+
+    # Gemma4e kernels require specific gate/projection tensor layouts.
+    if not arch.startswith('gemma4'):
+        return
+
+    if not all(isinstance(v, int) and v > 0 for v in (hidden_size, num_attention_heads, num_key_value_heads)):
+        raise RuntimeError(
+            "Gemma4 layout validation requires hidden_size, num_attention_heads, "
+            "and num_key_value_heads from config discovery."
+        )
+
+    if hidden_size % 10 != 0 or hidden_size % 256 != 0:
+        raise RuntimeError(
+            f"Gemma4 hidden_size={hidden_size} is invalid for expected q4nx layout checks."
+        )
+
+    header = _read_safetensors_header(model_q4nx_path)
+    expected = {
+        'model.layers.0.inp_gate.weight': [num_attention_heads, hidden_size, 32],
+        'model.layers.0.inp_gate.weight_prefill': [num_key_value_heads * 2, hidden_size // 256, 16384],
+        'model.layers.0.per_layer_projection.weight': [80, hidden_size // 10, 32],
+    }
+
+    mismatches = []
+    for tensor_name, expected_shape in expected.items():
+        actual_shape = _shape_of(header, tensor_name)
+        if actual_shape != expected_shape:
+            mismatches.append(
+                f"{tensor_name}: expected {expected_shape}, got {actual_shape}"
+            )
+
+    if mismatches:
+        msg = (
+            "Converted q4nx layout is incompatible with Gemma4e NPU kernels:\n"
+            + "\n".join(f"  - {m}" for m in mismatches)
+            + "\nRe-convert with a Gemma4e-compatible converter path."
+        )
+        raise RuntimeError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -445,8 +535,10 @@ def main():
                         help='Force a specific quantization level (default: auto, prefers Q4_1)')
     parser.add_argument('--keep-gguf', action='store_true',
                         help='Keep the downloaded GGUF file after conversion')
+    parser.add_argument('--text', action='store_true',
+                        help='Convert only the main language model GGUF (model.q4nx + tokenizer/template files)')
     parser.add_argument('--vision', action='store_true',
-                        help='Also convert the vision encoder (mmproj*.gguf) to vision_weight.q4nx')
+                        help='Convert only multimodal mmproj GGUF (vision_weight.q4nx + audio_weight.q4nx)')
 
     args = parser.parse_args()
     repo_id = args.huggingface.strip('/')
@@ -462,6 +554,27 @@ def main():
     for fname in candidates.get('mmproj', []):
         print(f"  [mmproj] {fname}")
 
+    # ---- Decide conversion scope ----
+    explicit_mode = args.text or args.vision
+    if explicit_mode:
+        do_text = args.text
+        do_vision = args.vision
+    else:
+        # Default behavior: auto-detect everything available in the repo.
+        do_text = any(q in candidates for q in QUANT_PREFERENCE + ['other'])
+        do_vision = bool(candidates.get('mmproj'))
+
+    if not do_text and not do_vision:
+        print("[ERROR] Nothing to do: no text GGUF or mmproj GGUF files were found.")
+        sys.exit(1)
+
+    mode_parts = []
+    if do_text:
+        mode_parts.append('text')
+    if do_vision:
+        mode_parts.append('vision/audio')
+    print(f"[INFO] Conversion mode: {', '.join(mode_parts)}")
+
     # ---- Gather architecture parameters ----
     params = gather_arch_params(repo_id, candidates)
 
@@ -470,107 +583,113 @@ def main():
     print(f"  hidden_size       = {params.get('hidden_size')}")
     print(f"  vocab_size        = {params.get('vocab_size')}")
     print(f"  intermediate_size = {params.get('intermediate_size')}")
+    print(f"  num_attn_heads    = {params.get('num_attention_heads')}")
+    print(f"  num_kv_heads      = {params.get('num_key_value_heads')}")
 
-    # ---- Compatibility checks ----
-    issues = check_compatibility(params)
-    blocking = [t for t, is_block in issues if is_block]
-    warnings = [t for t, is_block in issues if not is_block]
+    # ---- Compatibility checks (text conversion path) ----
+    if do_text:
+        issues = check_compatibility(params)
+        blocking = [t for t, is_block in issues if is_block]
+        warnings = [t for t, is_block in issues if not is_block]
 
-    print()
-    if warnings:
-        print("[WARN] Non-blocking notes:")
-        for w in warnings:
-            for line in w.splitlines():
-                print(f"  ! {line}")
-
-    if blocking:
-        print("[RESULT] This model cannot be converted to Q4NX:")
-        for issue in blocking:
-            lines = issue.splitlines()
-            print(f"  x {lines[0]}")
-            for line in lines[1:]:
-                print(f"    {line}")
         print()
-        print("[HINT] FastFlowLM NPU Q4NX hard constraints:")
-        print(f"  * vocab_size must be divisible by 32 (universal tile constraint)")
-        print(f"  * intermediate_size must be divisible by 32 (universal tile constraint)")
-        print(f"  * Architecture must have a registered converter")
-        print(f"  * hidden_size constraints vary per architecture's NPU library")
-        sys.exit(1)
+        if warnings:
+            print("[WARN] Non-blocking notes:")
+            for w in warnings:
+                for line in w.splitlines():
+                    print(f"  ! {line}")
 
-    print("[RESULT] Pre-check passed — model looks convertible.")
+        if blocking:
+            print("[RESULT] This model cannot be converted to Q4NX:")
+            for issue in blocking:
+                lines = issue.splitlines()
+                print(f"  x {lines[0]}")
+                for line in lines[1:]:
+                    print(f"    {line}")
+            print()
+            print("[HINT] FastFlowLM NPU Q4NX hard constraints:")
+            print(f"  * vocab_size must be divisible by 32 (universal tile constraint)")
+            print(f"  * intermediate_size must be divisible by 32 (universal tile constraint)")
+            print(f"  * Architecture must have a registered converter")
+            print(f"  * hidden_size constraints vary per architecture's NPU library")
+            sys.exit(1)
+
+        print("[RESULT] Pre-check passed — model looks convertible.")
+    else:
+        print("[INFO] Skipping text pre-checks (--text not selected).")
 
     if args.check_only:
         print("[INFO] --check-only specified, stopping here.")
         sys.exit(0)
-
-    # ---- Pick GGUF to download ----
-    chosen_quant = args.quant or next(
-        (q for q in QUANT_PREFERENCE if q in candidates), None
-    )
-    if not chosen_quant or chosen_quant not in candidates:
-        print(f"[ERROR] No suitable GGUF found. Available: {list(candidates.keys())}")
-        sys.exit(1)
-
-    chosen_file = candidates[chosen_quant][0]
-    print(f"[INFO] Selected: [{chosen_quant}] {chosen_file}")
 
     # ---- Set up output directory ----
     model_name = repo_id.split('/')[-1]
     output_dir = Path(args.output) if args.output else Path(f'./{model_name}')
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Download ----
-    gguf_path = download_gguf(repo_id, chosen_file, output_dir)
+    # ---- Text conversion path ----
+    if do_text:
+        chosen_quant = args.quant or next(
+            (q for q in QUANT_PREFERENCE if q in candidates), None
+        )
+        if not chosen_quant or chosen_quant not in candidates:
+            print(f"[ERROR] No suitable text GGUF found. Available: {list(candidates.keys())}")
+            sys.exit(1)
 
-    # ---- Convert ----
-    print(f"[INFO] Converting {gguf_path.name} -> {output_dir}/...")
-    try:
-        from q4nx import create_converter
-        model = create_converter(str(gguf_path), '')
-        model.convert(q4nx_path=str(output_dir), weights_type='language')
-    except Exception as e:
-        print(f"\n[ERROR] Conversion failed: {e}")
+        chosen_file = candidates[chosen_quant][0]
+        print(f"[INFO] Selected text model: [{chosen_quant}] {chosen_file}")
+
+        gguf_path = download_gguf(repo_id, chosen_file, output_dir)
+
+        print(f"[INFO] Converting {gguf_path.name} -> {output_dir}/...")
+        try:
+            from q4nx import create_converter
+            model = create_converter(str(gguf_path), '')
+            model.convert(q4nx_path=str(output_dir), weights_type='language')
+            validate_q4nx_output_layout(output_dir / 'model.q4nx', params)
+        except Exception as e:
+            print(f"\n[ERROR] Conversion failed: {e}")
+            if not args.keep_gguf:
+                gguf_path.unlink(missing_ok=True)
+            sys.exit(1)
+
         if not args.keep_gguf:
             gguf_path.unlink(missing_ok=True)
-        sys.exit(1)
+            print(f"[INFO] Removed temporary GGUF.")
 
-    if not args.keep_gguf:
-        gguf_path.unlink(missing_ok=True)
-        print(f"[INFO] Removed temporary GGUF.")
+        # ---- Fetch chat template ----
+        print(f"[INFO] Fetching chat template...")
+        tmpl = fetch_chat_template(repo_id)
+        if tmpl:
+            jinja_path = output_dir / 'chat_template.jinja'
+            jinja_path.write_text(tmpl, encoding='utf-8')
+            print(f"[INFO] chat_template.jinja written ({len(tmpl)} chars)")
+        else:
+            print(f"[WARN] No chat template found — chat_template.jinja not written.")
 
-    # ---- Fetch chat template ----
-    print(f"[INFO] Fetching chat template...")
-    tmpl = fetch_chat_template(repo_id)
-    if tmpl:
-        jinja_path = output_dir / 'chat_template.jinja'
-        jinja_path.write_text(tmpl, encoding='utf-8')
-        print(f"[INFO] chat_template.jinja written ({len(tmpl)} chars)")
-    else:
-        print(f"[WARN] No chat template found — chat_template.jinja not written.")
+        # ---- Fetch tokenizer config ----
+        print(f"[INFO] Fetching tokenizer_config.json...")
+        tok_cfg = fetch_tokenizer_config(repo_id)
+        if tok_cfg:
+            tok_cfg_path = output_dir / 'tokenizer_config.json'
+            tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2, ensure_ascii=False), encoding='utf-8')
+            print(f"[INFO] tokenizer_config.json written")
+        else:
+            print(f"[WARN] No tokenizer_config.json found — skipping.")
 
-    # ---- Fetch tokenizer config ----
-    print(f"[INFO] Fetching tokenizer_config.json...")
-    tok_cfg = fetch_tokenizer_config(repo_id)
-    if tok_cfg:
-        tok_cfg_path = output_dir / 'tokenizer_config.json'
-        tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2, ensure_ascii=False), encoding='utf-8')
-        print(f"[INFO] tokenizer_config.json written")
-    else:
-        print(f"[WARN] No tokenizer_config.json found — skipping.")
+        print(f"\n[INFO] Text conversion complete. Output: {output_dir}/model.q4nx")
 
-    print(f"\n[INFO] Done. Output: {output_dir}/model.q4nx")
-
-    # ---- Optional vision + audio encoder conversion ----
+    # ---- Vision/audio conversion path ----
     # Both vision and audio weights live in the same mmproj*.gguf file.
     # The converter filters by weights_type ('vision' vs 'audio') using the name_map.
-    if args.vision:
+    if do_vision:
         mmproj_files = candidates.get('mmproj', [])
         if not mmproj_files:
-            print("[WARN] --vision specified but no mmproj*.gguf found in repo — skipping vision/audio conversion.")
+            print("[WARN] No mmproj*.gguf found in repo — skipping vision/audio conversion.")
         else:
             import shutil
             mmproj_file = mmproj_files[0]
+            print(f"[INFO] Selected mmproj model: {mmproj_file}")
             mmproj_path = download_gguf(repo_id, mmproj_file, output_dir)
 
             for wtype, out_name in [('vision', 'vision_weight.q4nx'), ('audio', 'audio_weight.q4nx')]:
@@ -579,17 +698,26 @@ def main():
                 print(f"[INFO] Converting {wtype} encoder -> {output_dir}/{out_name} ...")
                 try:
                     from q4nx import create_converter
-                    enc_model = create_converter(str(mmproj_path), '')
+                    force_arch = ''
+                    if str(params.get('arch') or '').lower().startswith('gemma4'):
+                        # Gemma4 mmproj GGUFs often report architecture as "clip".
+                        # Force Gemma4 converter selection to reuse Gemma4 multimodal name maps.
+                        force_arch = 'gemma4'
+                    enc_model = create_converter(str(mmproj_path), force_arch)
                     enc_model.convert(q4nx_path=str(tmp_dir), weights_type=wtype)
                     (tmp_dir / 'model.q4nx').rename(output_dir / out_name)
                     print(f"[INFO] {wtype.capitalize()} encoder saved: {output_dir}/{out_name}")
                 except Exception as e:
-                    print(f"[WARN] {wtype.capitalize()} conversion failed (skipping): {e}")
+                    import traceback
+                    print(f"[WARN] {wtype.capitalize()} conversion failed (skipping): {type(e).__name__}: {e}")
+                    traceback.print_exc()
                 finally:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
 
             if not args.keep_gguf:
                 mmproj_path.unlink(missing_ok=True)
+
+    print(f"\n[INFO] Done. Output directory: {output_dir}")
 
 
 if __name__ == '__main__':

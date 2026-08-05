@@ -194,7 +194,7 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
         else:
             raise ValueError(f"Unsupported weights_type: {weights_type} for Qwen35 model")
 
-        self._export_q4nx_tensors(q4nx_path)
+        self._export_weights(q4nx_path, weights_type)
 
 
 class Qwen35_2B(Qwen35, model_arch=ModelArch.QWEN35_2B):

@@ -96,7 +96,9 @@ class __Q4NX_Converter(ABC):
                 self.num_layers = field.contents()
 
 
-    def _load_config(self, config_file_path: str = "configs"):
+    def _load_config(self, config_file_path: str = None):
+        if config_file_path is None:
+            config_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
         config_path = os.path.join(config_file_path, ModelArchConfigs[self.model_arch])
         print(f"[INFO] Loading Q4NX config from {config_path}")
         self.q4nx_config = json.load(open(config_path))
@@ -211,10 +213,36 @@ class __Q4NX_Converter(ABC):
                 return True 
         return False
 
-    def _export_q4nx_tensors(self, q4nx_path: str):
-        print(f"[INFO] Saving Q4NX tensors to {q4nx_path}/model.q4nx...")
+    def _export_q4nx_tensors(self, q4nx_path: str, filename: str = "model.q4nx"):
+        if q4nx_path.endswith(filename):
+            print(f"[INFO] Saving Q4NX tensors to {q4nx_path}...")
+            os.makedirs(os.path.dirname(q4nx_path) or ".", exist_ok=True)
+            save_file(self.q4nx_tensors, q4nx_path)
+            return
+        print(f"[INFO] Saving Q4NX tensors to {q4nx_path}/{filename}...")
         create_dir_if_not_exists(q4nx_path)
-        save_file(self.q4nx_tensors, os.path.join(q4nx_path, "model.q4nx"))
+        save_file(self.q4nx_tensors, os.path.join(q4nx_path, filename))
+
+    def _export_weights(self, q4nx_path: str, weights_type: str = "language"):
+        """Export the current tensor dict to the file expected by the FLM
+        runtime for the given weight type.
+
+        The runtime reads the file name for vision/audio weights from the
+        model's config.json (``vision_model_weight`` / ``audio_model_weight``).
+        The names used by the official FLM model repos are:
+          - language -> model.q4nx
+          - vision   -> vision_weight.q4nx  (qwen2vl uses vision_weights.q4nx)
+          - audio    -> audio_weight.q4nx
+        """
+        if weights_type == "language":
+            filename = "model.q4nx"
+        elif weights_type == "vision":
+            filename = self.q4nx_config.get("vision_config", {}).get("vision_file", "vision_weight.q4nx")
+        elif weights_type == "audio":
+            filename = self.q4nx_config.get("audio_config", {}).get("audio_file", "audio_weight.q4nx")
+        else:
+            raise ValueError(f"Unsupported weights_type: {weights_type}")
+        self._export_q4nx_tensors(q4nx_path, filename=filename)
 
     def _pack_MXFP4_q4nx(self, scales:torch.Tensor, data:torch.Tensor,    
             )->torch.Tensor:
@@ -541,10 +569,15 @@ class __Q4NX_Converter(ABC):
             m = m.contiguous() 
             
         rows, cols = data.shape[0], data.shape[1]
-        
-        
 
-        
+        if rows % self.row_block_size != 0:
+            rows_padded = round_up_to_multiple(rows, self.row_block_size)
+            print(f"[INFO] Padding tensor rows from {rows} to {rows_padded}")
+            row_pad_amount = rows_padded - rows
+            scales = F.pad(scales, (0, 0, 0, row_pad_amount), "constant", 0)
+            m = F.pad(m, (0, 0, 0, row_pad_amount), "constant", 0)
+            data = F.pad(data, (0, 0, 0, row_pad_amount), "constant", 0)
+
         if cols % self.col_block_size != 0:
             cols_padded = round_up_to_multiple(cols, self.col_block_size)
             
@@ -644,6 +677,14 @@ class __Q4NX_Converter(ABC):
             return d.to(torch.bfloat16)
 
         rows, cols = qw.shape
+
+        if rows % self.row_block_size != 0:
+            rows_padded = round_up_to_multiple(rows, self.row_block_size)
+            print(f"[INFO] Padding tensor rows from {rows} to {rows_padded}")
+            row_pad_amount = rows_padded - rows
+            d = F.pad(d, (0, 0, 0, row_pad_amount), "constant", 0)
+            m = F.pad(m, (0, 0, 0, row_pad_amount), "constant", 0)
+            qw = F.pad(qw, (0, 0, 0, row_pad_amount), "constant", 0)
 
         if cols%self.col_block_size != 0:
             cols_padded = round_up_to_multiple(cols, self.col_block_size)

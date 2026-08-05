@@ -24,15 +24,14 @@ Based on the configuration, the converter supports several model architectures, 
 
 The project includes a setup script that automatically creates a Python virtual environment, installs required dependencies (like `torch`, `amd-quark`, `transformers`), and sets up the `gguf` package from `llama.cpp`.
 
-1. Make the setup script executable (if it isn't already) and run it:
+1. Create and activate a virtual environment using pip or uv:
    ```bash
-   chmod +x setup_venv.sh
-   ./setup_venv.sh
+   uv venv venv
+   venv/bin/activate
    ```
-
-2. Activate the environment using the provided activation script. **Note:** Always use `activate.sh` instead of directly sourcing the venv, as it also sets up necessary environment variables like `HF_HOME` and CUDA paths.
+2. Install dependencies (one time)
    ```bash
-   source activate.sh
+   uv pip install -r requirements.txt
    ```
 
 ## Usage

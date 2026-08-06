@@ -6,7 +6,7 @@ from q4nx import create_converter
 from q4nx.model_assets import assemble_model_assets, get_default_flm_version
 
 
-def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None):
+def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None):
     model = create_converter(gguf_path, override_model_arch)
     model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
     if flm_version is None:
@@ -18,6 +18,16 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
         source_model=source_model,
         flm_version=flm_version,
     )
+    if deploy_tag:
+        from q4nx.deploy import deploy_model
+        deploy_model(
+            q4nx_path,
+            deploy_tag,
+            model.model_arch,
+            model_dir_name=deploy_name,
+            deploy_from=deploy_from,
+        )
+    return model
 
 
 def main():
@@ -44,6 +54,12 @@ def main():
                         help="Source HF/ModelScope model for tokenizer/config assets. A local dir, an HF cache repo name, or a repo id like 'Qwen/Qwen3.5-9B'. If omitted, the GGUF's provenance metadata is followed (local HF cache first, then SDK download).")
     parser.add_argument('--flm-version', dest='flm_version', default=None,
                         help="flm_version to write into the generated config.json (default: detected from `flm --version`)" )
+    parser.add_argument('-d', '--deploy', dest='deploy_tag', default=None, metavar='NAME:SIZE',
+                        help="Deploy the converted model into flm's models directory and register it under this tag (e.g. 'qwen3.5-claude:9b'). Uses a user-level model_list.json (point FLM_CONFIG_PATH at it to make `flm run` see the tag).")
+    parser.add_argument('--deploy-from', dest='deploy_from', default=None, metavar='SOURCE_TAG',
+                        help="Official registry entry to copy defaults from (e.g. 'qwen3.5:9b'). Auto-detected from the model architecture if omitted.")
+    parser.add_argument('--deploy-name', dest='deploy_name', default=None, metavar='DIR',
+                        help="Directory name inside flm's models dir (default: derived from the deploy tag, e.g. Qwen3.5-Claude-9B-NPU2).")
     
     args = parser.parse_args()
     
@@ -66,7 +82,7 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
     
     print(f"[INFO] Converting {input_path} to {output_folder}...")
-    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, flm_version=args.flm_version)
+    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, flm_version=args.flm_version, deploy_tag=args.deploy_tag, deploy_from=args.deploy_from, deploy_name=args.deploy_name)
     print(f"[INFO] Conversion complete! Output saved to {output_folder}")
 
 

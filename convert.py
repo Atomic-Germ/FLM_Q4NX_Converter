@@ -2,22 +2,42 @@
 import argparse
 import os
 from pathlib import Path
-from q4nx import create_converter
-from q4nx.model_assets import assemble_model_assets, get_default_flm_version
+from q4nx import create_converter, create_hf_converter
+from q4nx.model_assets import assemble_model_assets, assemble_model_assets_hf, get_default_flm_version
+
+
+def is_hf_source(path: str) -> bool:
+    if os.path.isdir(path):
+        return (
+            os.path.exists(os.path.join(path, "model.safetensors"))
+            or os.path.exists(os.path.join(path, "model.safetensors.index.json"))
+        )
+    return False
 
 
 def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None):
-    model = create_converter(gguf_path, override_model_arch)
-    model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
     if flm_version is None:
         flm_version = get_default_flm_version()
-    assemble_model_assets(
-        model.gguf_reader,
-        model.q4nx_config,
-        q4nx_path,
-        source_model=source_model,
-        flm_version=flm_version,
-    )
+    if is_hf_source(gguf_path):
+        model = create_hf_converter(gguf_path, override_model_arch)
+        model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
+        assemble_model_assets_hf(
+            model.hf_source,
+            model.q4nx_config,
+            q4nx_path,
+            source_model=source_model,
+            flm_version=flm_version,
+        )
+    else:
+        model = create_converter(gguf_path, override_model_arch)
+        model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
+        assemble_model_assets(
+            model.gguf_reader,
+            model.q4nx_config,
+            q4nx_path,
+            source_model=source_model,
+            flm_version=flm_version,
+        )
     if deploy_tag:
         from q4nx.deploy import deploy_model
         deploy_model(
@@ -32,12 +52,12 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert GGUF model files to Q4NX format (output always named model.q4nx)',
+        description='Convert GGUF or HF-safetensors model files to Q4NX format (output always named model.q4nx)',
         epilog='Examples:\n'
                '  python convert.py -i model.gguf\n'
                '  python convert.py -i model.gguf -o output_folder\n'
                '  python convert.py model.gguf output_folder\n'
-               '  python convert.py model.gguf .\n'
+               '  python convert.py -i /path/to/hf_model_dir -o output_folder   (HF safetensors source, e.g. Darwin-36B-Opus)\n'
                '  python convert.py -i vision_model.gguf -o output_folder -t vision',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )

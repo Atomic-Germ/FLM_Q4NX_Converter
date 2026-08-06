@@ -312,6 +312,75 @@ def ensure_runtime_tokenizer_ids(reader, output_dir: Path):
         print(f"[INFO] Patched {path.name} with token ids from GGUF metadata")
 
 
+def _tokenizer_id_lookup(tokenizer_path: Path) -> Dict[str, int]:
+    """Map token text -> token id from tokenizer.json (added tokens first, then vocab)."""
+    if not tokenizer_path.exists():
+        return {}
+    try:
+        with open(tokenizer_path, encoding="utf-8") as f:
+            tokenizer = json.load(f)
+    except Exception:
+        return {}
+    lookup: Dict[str, int] = {}
+    for added in tokenizer.get("added_tokens", []):
+        content = added.get("content")
+        if content is not None:
+            lookup[content] = int(added["id"])
+    vocab = tokenizer.get("model", {}).get("vocab", {})
+    for text, token_id in vocab.items():
+        lookup.setdefault(text, int(token_id))
+    return lookup
+
+
+def ensure_hf_tokenizer_ids(output_dir: Path) -> None:
+    """Backfill EOS/BOS/PAD token ids into a copied HF tokenizer_config.json.
+
+    The FLM runtime stops generation only when the sampled token id appears in
+    ``tokenizer_config["eos_token_id"]``. HF Qwen-family repos ship that field as
+    null (the end-of-turn token lives in ``eos_token``), which silently disables
+    end-of-generation. Resolve each token string against the tokenizer and
+    normalize ``eos_token_id`` to a list so converted models actually stop.
+    """
+    path = output_dir / "tokenizer_config.json"
+    if not path.exists():
+        return
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    lookup = _tokenizer_id_lookup(output_dir / "tokenizer.json")
+    config: dict = {}
+    config_path = output_dir / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
+    changed = False
+    for token_key, id_key in [
+        ("eos_token", "eos_token_id"),
+        ("bos_token", "bos_token_id"),
+        ("pad_token", "pad_token_id"),
+    ]:
+        token_text = cfg.get(token_key)
+        current = cfg.get(id_key)
+        if (current is None or current == [] or current == "") and isinstance(token_text, str):
+            resolved = lookup.get(token_text)
+            if resolved is None and config.get(id_key) is not None:
+                resolved = int(config[id_key])
+            if resolved is not None:
+                cfg[id_key] = resolved
+                changed = True
+    if cfg.get("eos_token_id") is not None:
+        eos = cfg["eos_token_id"]
+        if not isinstance(eos, list):
+            cfg["eos_token_id"] = [eos]
+            changed = True
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        print(f"[INFO] Patched {path.name} with EOS/BOS/PAD token ids from HF tokenizer")
+
+
 def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_version: Optional[str]):
     """Restructure a source HF config.json into the shape the FLM runtime expects.
 
@@ -361,6 +430,52 @@ def get_default_flm_version() -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def assemble_model_assets_hf(
+    hf_source: str,
+    q4nx_config: dict,
+    output_dir: str,
+    source_model: Optional[str] = None,
+    flm_version: Optional[str] = None,
+) -> None:
+    """Build a complete model directory from an HF safetensors source.
+
+    Same result as assemble_model_assets but sourced straight from an HF repo
+    (no GGUF provenance involved): config.json / tokenizer.json /
+    tokenizer_config.json / chat_template.jinja are copied from the HF model,
+    then the config is restructured for the FLM runtime.
+    """
+    output_dir = Path(output_dir)
+    if output_dir.suffix == ".q4nx":
+        output_dir = output_dir.parent
+    os.makedirs(output_dir, exist_ok=True)
+
+    candidate = source_model or hf_source
+    fetched = _fetch_assets(candidate, output_dir, ASSET_FILES)
+    missing = [f for f in REQUIRED_ASSETS if f not in fetched]
+    if missing:
+        print(f"[WARN] HF source {candidate} missing required assets: {missing}")
+
+    config_path = output_dir / "config.json"
+    if config_path.exists():
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        config = {}
+    if (
+        config.get("model_type") in ("qwen3_5_moe_text", "qwen3_5_moe")
+        and "moe_intermediate_size" in config
+        and "intermediate_size" not in config
+    ):
+        config["intermediate_size"] = config["moe_intermediate_size"]
+    inject_flm_keys(config, q4nx_config, output_dir, flm_version)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+    ensure_hf_tokenizer_ids(output_dir)
+
+    print(f"[INFO] Model directory ready: {output_dir}")
 
 
 def assemble_model_assets(

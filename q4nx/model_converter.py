@@ -1150,3 +1150,35 @@ def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converte
     converter_instance = converter_class(reader)
 
     return converter_instance
+
+
+def create_hf_converter(
+    hf_source: str, override_model_arch: str = "", config_json_path: str | None = None
+) -> __Q4NX_Converter:
+    """Factory for HF-safetensors-source converters.
+
+    Only the Qwen3.5 MoE converter supports an HF source for now.
+    """
+    if override_model_arch:
+        normalized_override = override_model_arch.replace(":", "-").lower()
+        for arch_enum, arch_names in ModelArchNames.items():
+            for arch_name in arch_names:
+                if normalized_override.startswith(arch_name.lower()):
+                    model_arch = arch_enum
+                    break
+            else:
+                continue
+            break
+        else:
+            model_arch = None
+    else:
+        model_arch = ModelArch.QWEN35MOE
+
+    if model_arch != ModelArch.QWEN35MOE:
+        raise ValueError(
+            f"No HF-safetensors converter for architecture: "
+            f"{ModelArchNames.get(model_arch, model_arch) if model_arch is not None else override_model_arch}. "
+            "HF-direct conversion is only supported for qwen35moe."
+        )
+    converter_class = _MODEL_REGISTRY[ModelArch.QWEN35MOE]
+    return converter_class(hf_source, config_json_path=config_json_path)

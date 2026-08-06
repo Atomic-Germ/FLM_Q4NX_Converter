@@ -18,6 +18,16 @@ from .utils import round_up_to_multiple, get_relativeL2, get_relativeL1, get_rms
 from safetensors.torch import save_file
 from q4nx.gguf_tensor import GGUFTensor
 from gguf import Q8_0, GGUFReader, dequantize, quantize, GGMLQuantizationType
+
+# Qwen3.5 variant detection: llama.cpp GGUFs expose general.architecture ==
+# 'qwen35' with no size suffix, so the variant is inferred from the embedding
+# dimension (qwen35.embedding_length).
+QWEN35_VARIANT_DIMS: Dict[ModelArch, int] = {
+    ModelArch.QWEN35_08B: 1536,
+    ModelArch.QWEN35_2B: 2304,
+    ModelArch.QWEN35_4B: 2560,
+    ModelArch.QWEN35_9B: 4096,
+}
 # Registry to store model classes by architecture
 _MODEL_REGISTRY: Dict[ModelArch, Type['__Q4NX_Converter']] = {}
 
@@ -493,7 +503,10 @@ class __Q4NX_Converter(ABC):
             
     def _pack(self, d: torch.Tensor, m: torch.Tensor = None, qw: torch.Tensor = None, tensor_type: GGMLQuantizationType = None) -> torch.Tensor:
         if tensor_type == GGMLQuantizationType.Q8_0:
-            return self._pack_q4nx_8b(d, m, qw)
+            # Q8NX format: scale array (d, bf16) followed by int8 data, no min
+            # array. This matches the official Q8_0-packed tensors (alpha/beta/
+            # out_proj/lm_head) which use 8704-byte chunks (256 blocks x 34).
+            return self._pack_q8nx(data=qw, scales=d, m=None)
         else:
             return self._pack_q4nx(d, m, qw)
         
@@ -524,7 +537,7 @@ class __Q4NX_Converter(ABC):
         self.col_block_size = col_block_size_old
         return q8nx_pack_result
         
-    def _pack_q8nx(self,  data: torch.Tensor,scales: torch.Tensor, m:torch.Tensor) -> torch.Tensor:
+    def _pack_q8nx(self,  data: torch.Tensor,scales: torch.Tensor, m:torch.Tensor|None=None) -> torch.Tensor:
         #note, support q80 for now
         """ Q8NX format similar to Q4NX
 
@@ -562,11 +575,13 @@ class __Q4NX_Converter(ABC):
         if scales.shape[-1] == 1:
             scales = scales.reshape(*scales.shape[:-2], -1).contiguous()
             data = data.reshape(*data.shape[:-2], -1).contiguous()
-            m = m.reshape(*m.shape[:-2], -1).contiguous()
+            if m is not None:
+                m = m.reshape(*m.shape[:-2], -1).contiguous()
         else:
             scales = scales.contiguous()
             data = data.contiguous()
-            m = m.contiguous() 
+            if m is not None:
+                m = m.contiguous()
             
         rows, cols = data.shape[0], data.shape[1]
 
@@ -575,7 +590,8 @@ class __Q4NX_Converter(ABC):
             print(f"[INFO] Padding tensor rows from {rows} to {rows_padded}")
             row_pad_amount = rows_padded - rows
             scales = F.pad(scales, (0, 0, 0, row_pad_amount), "constant", 0)
-            m = F.pad(m, (0, 0, 0, row_pad_amount), "constant", 0)
+            if m is not None:
+                m = F.pad(m, (0, 0, 0, row_pad_amount), "constant", 0)
             data = F.pad(data, (0, 0, 0, row_pad_amount), "constant", 0)
 
         if cols % self.col_block_size != 0:
@@ -585,7 +601,8 @@ class __Q4NX_Converter(ABC):
             data_pad_amount = cols_padded - cols
             
             scales = F.pad(scales, (0, scale_pad_amount), "constant", 0)
-            m = F.pad(m, (0, scale_pad_amount), "constant", 0)
+            if m is not None:
+                m = F.pad(m, (0, scale_pad_amount), "constant", 0)
             data = F.pad(data, (0, data_pad_amount), "constant", 0)
         
 
@@ -603,12 +620,13 @@ class __Q4NX_Converter(ABC):
 
             ).contiguous()
             
-            m = rearrange(
-                m,
-                "(row_div_r r) (col_div_c c) -> row_div_r col_div_c (c r)",
-                r=self.row_block_size,
-                c=self.col_block_size // Q8_group_size                
-            ).contiguous()
+            if m is not None:
+                m = rearrange(
+                    m,
+                    "(row_div_r r) (col_div_c c) -> row_div_r col_div_c (c r)",
+                    r=self.row_block_size,
+                    c=self.col_block_size // Q8_group_size                
+                ).contiguous()
             
             assert self.row_block_size % self.parallel_size == 0
             # similar, for the data block
@@ -634,22 +652,28 @@ class __Q4NX_Converter(ABC):
             scales = scales.to(torch.bfloat16)
             
             # also convert m from float16 to bfloat16
-            assert(m.dtype == torch.float16)
-            m = m.to(torch.bfloat16)
+            if m is not None:
+                assert(m.dtype == torch.float16)
+                m = m.to(torch.bfloat16)
         
             
         else:
             raise ValueError("Only support keep_block_in_2D for now")
         
         scales = scales.view(torch.int8)
-        m = m.view(torch.int8)
+        if m is not None:
+            m = m.view(torch.int8)
         data = data.view(torch.int8)
         
         scales_np = scales.numpy()
-        m_np = m.numpy()
         data_np = data.numpy()
-        # do  a copy of scales_np for now, for padding space
-        merged = np.concatenate([scales_np,  m_np, data_np], axis = -1).copy()
+        if m is not None:
+            m_np = m.numpy()
+            # do  a copy of scales_np for now, for padding space
+            merged = np.concatenate([scales_np,  m_np, data_np], axis = -1).copy()
+        else:
+            # do  a copy of scales_np for now, for padding space
+            merged = np.concatenate([scales_np, data_np], axis = -1).copy()
         
         return torch.from_numpy(merged)       
     
@@ -1022,10 +1046,20 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
     """
     
     if override_model_arch != "":
+        # flm model names use a colon (e.g. 'qwen3.5:9b') while arch names use
+        # a dash (e.g. 'qwen3.5-9B'). Normalize before matching, and prefer the
+        # longest matching arch name so 'qwen3.5:9b' selects the Qwen3.5 9B
+        # converter instead of the prefix-matched plain Qwen3 converter.
+        normalized_override = override_model_arch.replace(":", "-").lower()
+        best_match: ModelArch | None = None
+        best_len = 0
         for arch_enum, arch_names in ModelArchNames.items():
-            for arch_name in arch_names:            
-                if override_model_arch.lower().startswith(arch_name.lower()):
-                    return arch_enum
+            for arch_name in arch_names:
+                if normalized_override.startswith(arch_name.lower()) and len(arch_name) > best_len:
+                    best_match = arch_enum
+                    best_len = len(arch_name)
+        if best_match is not None:
+            return best_match
         print("Warning: Did not find matching override model arch, attempting to load base on gguf information")
 
     
@@ -1041,19 +1075,34 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
     
 
     # Map the architecture string to ModelArch enum
-    for arch_enum, arch_names in ModelArchNames.items():
-        for arch_name in arch_names:
-            if arch_str.lower() == arch_name.lower():
-                return arch_enum
-    
+    if arch_str is not None:
+        for arch_enum, arch_names in ModelArchNames.items():
+            for arch_name in arch_names:
+                if arch_str.lower() == arch_name.lower():
+                    return arch_enum
 
-    for arch_enum, arch_names in ModelArchNames.items():
-        for arch_name in arch_names:
-            if basename_str.lower().startswith(arch_name.lower()):
-                return arch_enum
+    # llama.cpp reports the Qwen3.5 architecture without a size suffix
+    # (general.architecture == 'qwen35'), so infer the variant from the
+    # embedding dimension.
+    if arch_str is not None and arch_str.lower() in ("qwen35", "qwen3.5"):
+        field = reader.fields.get("qwen35.embedding_length")
+        if field is not None:
+            dim = field.contents()
+            for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
+                if dim == expected_dim:
+                    return variant
+
+    if basename_str is not None:
+        for arch_enum, arch_names in ModelArchNames.items():
+            for arch_name in arch_names:
+                if basename_str.lower().startswith(arch_name.lower()):
+                    return arch_enum
 
 
-    raise ValueError(f"Unsupported model architecture: {arch_str}")
+    raise ValueError(
+        f"Unsupported model architecture: {arch_str or basename_str or '(no general.architecture field)'}. "
+        "Use -f to force the model type."
+    )
 
 
 def get_registered_models() -> Dict[ModelArch, Type['__Q4NX_Converter']]:

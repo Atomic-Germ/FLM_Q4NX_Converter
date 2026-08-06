@@ -3,11 +3,21 @@ import argparse
 import os
 from pathlib import Path
 from q4nx import create_converter
+from q4nx.model_assets import assemble_model_assets, get_default_flm_version
 
 
-def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language'):
+def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None):
     model = create_converter(gguf_path, override_model_arch)
     model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
+    if flm_version is None:
+        flm_version = get_default_flm_version()
+    assemble_model_assets(
+        model.gguf_reader,
+        model.q4nx_config,
+        q4nx_path,
+        source_model=source_model,
+        flm_version=flm_version,
+    )
 
 
 def main():
@@ -30,6 +40,10 @@ def main():
     parser.add_argument('-t', '--type', dest='weights_type', default='language', help='Type of weights to convert (default: language)',
                         choices=['language', 'vision', 'audio'])
     parser.add_argument('-f', '--force', dest='force_model_type', default="", help="Model type. Empty string for automatic recognition from gguf file")
+    parser.add_argument('-s', '--source-model', dest='source_model', default=None,
+                        help="Source HF/ModelScope model for tokenizer/config assets. A local dir, an HF cache repo name, or a repo id like 'Qwen/Qwen3.5-9B'. If omitted, the GGUF's provenance metadata is followed (local HF cache first, then SDK download).")
+    parser.add_argument('--flm-version', dest='flm_version', default=None,
+                        help="flm_version to write into the generated config.json (default: detected from `flm --version`)" )
     
     args = parser.parse_args()
     
@@ -52,7 +66,7 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
     
     print(f"[INFO] Converting {input_path} to {output_folder}...")
-    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type)
+    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, flm_version=args.flm_version)
     print(f"[INFO] Conversion complete! Output saved to {output_folder}")
 
 

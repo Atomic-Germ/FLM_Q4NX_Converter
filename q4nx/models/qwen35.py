@@ -48,7 +48,7 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 if "layers." in new_name:
                     layer_id = int(new_name.split("layers.")[1].split(".")[0])
 
-                unpacked = gguf_tensor.unpack(self.tensor_q4nx_type_map[gguf_tensor.name])
+                unpacked = gguf_tensor.unpack(target_dtype)
 
                 if layer_id % full_attntion_interval == (full_attntion_interval - 1):    
                     if "q_proj" in self.forward_name_map[gguf_tensor.name]: # for llama q_proj, the order is special

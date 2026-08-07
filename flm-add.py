@@ -16,7 +16,10 @@ FastFlowLM entry.
 
 The script never rewrites the system model list or the system xclbins; it
 writes a user-level registry at ~/.config/flm/model_list.json and adds a single
-symlink into ~/.config/flm/xclbins/ for the new model directory. The only thing
+symlink into ~/.config/flm/xclbins/ for the new model directory. Custom FLM
+models never ship xclbins (they are closed source), so the kernel symlink is
+always taken from the matching official model, keyed by family (engine) and
+size -- e.g. Darwin-36B-Opus-NPU2 -> Qwen3.6-35B-A3B-NPU2. The only thing
 you need in your shell rc afterwards is:
 
     export FLM_CONFIG_PATH="$HOME/.config/flm/model_list.json"
@@ -210,22 +213,59 @@ def match_official_entry(system_registry, dir_name):
     return best
 
 
+def _official_entries(system_registry, family):
+    return [
+        (bucket, sz, info)
+        for bucket, sizes in system_registry.get("models", {}).items()
+        for sz, info in sizes.items()
+        if (info.get("details") or {}).get("family") == family
+    ]
+
+
 def match_official_by_family_size(system_registry, family, size):
     """Official entry matching details.family and registry size (bytes).
 
-    Fallback for repos that share an engine with an official model but not a
+    Used for repos that share an engine with an official model but not a
     name prefix (e.g. Huihui-Qwythos-9B-... -> qwen3.5 + 9B -> Qwen3.5-9B-NPU2).
     """
     if not family or not size:
         return None
-    for bucket, sizes in system_registry.get("models", {}).items():
-        for sz, info in sizes.items():
-            if info.get("size") != size:
-                continue
-            if (info.get("details") or {}).get("family") != family:
-                continue
+    for bucket, sz, info in _official_entries(system_registry, family):
+        if info.get("size") == size:
             return (0, bucket, sz, info)
     return None
+
+
+def resolve_official(system_registry, dir_name, family, size):
+    """Pick the official model that supplies the xclbins for this install.
+
+    Custom FLM models never ship xclbins (closed source), so the kernels must
+    be linked from the matching official model, keyed by family (engine) and
+    size. Returns (official_4tuple, note) where note explains any size
+    mismatch, or (None, None) when no official model matches.
+    """
+    official = match_official_entry(system_registry, dir_name)
+    if official:
+        return official, None
+    official = match_official_by_family_size(system_registry, family, size)
+    if official:
+        return official, None
+    entries = _official_entries(system_registry, family)
+    if len(entries) == 1:
+        bucket, sz, info = entries[0]
+        note = None
+        if size:
+            official_size = info.get("size", 0)
+            if official_size and official_size != size:
+                note = f"tag size {size/1e9:g}B differs from official {official_size/1e9:g}B"
+        return (0, bucket, sz, info), note
+    if entries and size:
+        best = min(entries, key=lambda e: abs(e[2].get("size", 0) - size))
+        bucket, sz, info = best
+        return (0, bucket, sz, info), (
+            f"no exact size match for {size/1e9:g}B; using {info.get('size', 0)/1e9:g}B kernels"
+        )
+    return None, None
 
 
 def derive_family(system_registry, dir_name, explicit=None, base_entry=None):
@@ -464,7 +504,7 @@ def register(user_list_path, tag, entry, system_registry):
 def link_xclbins(system_root, user_root, dir_name, source_name, force=False, quiet=False):
     if not source_name:
         if not quiet:
-            log("[WARN] No matching official model; skipping xclbin symlink.")
+            log("[WARN] No xclbin source; skipping symlink. Pass --xclbin-from NAME to link an official model's kernels.")
         return
     src = system_root / source_name
     if not src.is_dir():
@@ -505,6 +545,7 @@ def main():
     ap.add_argument("--config", help="model_list.json to update (default: $FLM_CONFIG_PATH or ~/.config/flm/model_list.json)")
     ap.add_argument("--models-root", help="models directory (default: $FLM_MODEL_PATH or ~/.config/flm/models)")
     ap.add_argument("--xclbin-dir", help="user xclbins directory (default: ~/.config/flm/xclbins)")
+    ap.add_argument("--xclbin-from", help="official model directory name to link xclbins from (default: best match, e.g. Qwen3.6-35B-A3B-NPU2)")
     ap.add_argument("--system-list", help="official model_list.json used for defaults (default: auto-detect)")
     ap.add_argument("--modelscope", action="store_true", help="Treat REPO as a ModelScope repo id")
     ap.add_argument("--no-xclbin", action="store_true", help="Do not create the xclbins symlink")
@@ -534,19 +575,23 @@ def main():
     base_entry = official[3] if official else None
     family = derive_family(system_registry, dir_name, args.family, base_entry)
     size_value = (base_entry or {}).get("size") or size_from_tag(tag)
-    if not base_entry:
-        fallback = match_official_by_family_size(system_registry, family, size_value)
-        if fallback:
-            official = fallback
-            base_entry = fallback[3]
+    official, official_note = resolve_official(system_registry, dir_name, family, size_value)
+    base_entry = official[3] if official else None
     src_tag = f"{official[1]}:{official[2]}" if official else None
+    xclbin_source = args.xclbin_from or (base_entry or {}).get("name")
+    if not args.dry_run:
+        if official:
+            note = f" ({official_note})" if official_note else ""
+            log(f"[INFO] xclbins from official {src_tag}{note}")
+        else:
+            log("[WARN] No official model matched; no xclbins link. Pass --xclbin-from NAME (or --no-xclbin).")
 
     if args.dry_run:
         print(f"repo directory : {dir_name}")
         print(f"tag            : {tag}")
         print(f"details.family : {family}")
         print(f"official match : {src_tag or '(none)'}")
-        print(f"xclbin source  : {(base_entry or {}).get('name') or '(none)'}")
+        print(f"xclbin source  : {xclbin_source or '(none)'}")
         print(f"models dir     : {target}")
         print(f"registry       : {user_list}")
         return
@@ -591,7 +636,7 @@ def main():
                 system_root,
                 user_xclbin_dir(args.xclbin_dir),
                 dir_name,
-                (base_entry or {}).get("name"),
+                xclbin_source,
                 force=args.force,
                 quiet=args.quiet,
             )

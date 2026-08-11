@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from gguf import GGUFReader
 from .constants import ModelArch, ModelArchNames
 from .constants import ModelArchConfigs
+from .constants import QWEN35_VARIANT_DIMS
+from .arch_detect import detect_model_family
 from .gguf_tensor import GGUFTensor, GGMLQuantizationType
 from typing import List, Dict, Type
 import os
@@ -19,15 +21,6 @@ from safetensors.torch import save_file
 from q4nx.gguf_tensor import GGUFTensor
 from gguf import Q8_0, GGUFReader, dequantize, quantize, GGMLQuantizationType
 
-# Qwen3.5 variant detection: llama.cpp GGUFs expose general.architecture ==
-# 'qwen35' with no size suffix, so the variant is inferred from the embedding
-# dimension (qwen35.embedding_length).
-QWEN35_VARIANT_DIMS: Dict[ModelArch, int] = {
-    ModelArch.QWEN35_08B: 1536,
-    ModelArch.QWEN35_2B: 2304,
-    ModelArch.QWEN35_4B: 2560,
-    ModelArch.QWEN35_9B: 4096,
-}
 # Registry to store model classes by architecture
 _MODEL_REGISTRY: Dict[ModelArch, Type['__Q4NX_Converter']] = {}
 
@@ -1097,6 +1090,24 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
             for arch_name in arch_names:
                 if basename_str.lower().startswith(arch_name.lower()):
                     return arch_enum
+
+
+    # --- heuristic fallback: "close enough" guess the user can refine ---
+    guesses = detect_model_family(reader)
+    for guess in guesses:
+        if guess.arch not in _MODEL_REGISTRY:
+            continue
+        print("[WARN] general.architecture was missing or unrecognized; using a heuristic guess.")
+        print(f"[WARN] Best guess: {guess.arch.name} ({guess.confidence} confidence).")
+        for reason in guess.reasons:
+            print(f"         - {reason}")
+        if len(guesses) > 1:
+            others = ", ".join(
+                f"{g.arch.name} ({g.confidence})" for g in guesses if g.arch != guess.arch
+            )
+            print(f"[WARN] Other candidates: {others}")
+        print("[WARN] If this is wrong, force the type with -f <arch-name>.")
+        return guess.arch
 
 
     raise ValueError(

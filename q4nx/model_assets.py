@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -202,6 +203,215 @@ def _fetch_assets(candidate: str, output_dir: Path, files: List[str]) -> List[st
             print(f"[INFO] Downloaded model assets from {candidate}")
         return downloaded
     return []
+
+
+# ---------------------------------------------------------------------------
+# README generation
+# ---------------------------------------------------------------------------
+
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} B"
+            return f"{size:.2f} {unit}".rstrip("0").rstrip(".")
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def _read_source_file(candidate: str, filename: str) -> Optional[str]:
+    """Read a text file (e.g. README.md) from a candidate repo, without writing it."""
+    source_dir = _source_dir_for_candidate(candidate)
+    if source_dir is not None:
+        path = source_dir / filename
+        if path.is_file():
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return None
+    if "/" in candidate:
+        path = _hf_download_file(candidate, filename)
+        if path:
+            try:
+                return Path(path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return None
+    return None
+
+
+def _fetch_source_readme(candidates: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (source_id, readme_text) for the first candidate with a README.md."""
+    for candidate in candidates:
+        if not candidate:
+            continue
+        text = _read_source_file(candidate, "README.md")
+        if text:
+            return candidate, text
+    return None, None
+
+
+def _source_link(source: str) -> Optional[str]:
+    """HF model-card URL for a repo id, None for local paths / non-repo strings."""
+    if not source or os.path.isdir(source) or source.startswith(("/", ".", "\\")):
+        return None
+    parts = source.split("/")
+    if len(parts) == 2 and all(parts) and "\\" not in source:
+        return f"https://huggingface.co/{source}"
+    return None
+
+
+def _modality_label(output_dir: Path) -> str:
+    labels = []
+    if (output_dir / "model.q4nx").is_file():
+        labels.append("language")
+    if (output_dir / "vision_weight.q4nx").is_file():
+        labels.append("vision")
+    if (output_dir / "audio_weight.q4nx").is_file():
+        labels.append("audio")
+    return " / ".join(labels) or "language"
+
+
+def build_readme_meta(output_dir: Path, flm_version: Optional[str]) -> dict:
+    """Gather conversion metadata used to render the README banner."""
+    meta = {
+        "title": output_dir.name or None,
+        "tag": output_dir.name,
+        "modality": _modality_label(output_dir),
+        "flm_version": flm_version,
+        "date": date.today().isoformat(),
+    }
+    for filename in ("model.q4nx", "vision_weight.q4nx", "audio_weight.q4nx"):
+        path = output_dir / filename
+        if path.is_file():
+            meta["weight_file"] = filename
+            meta["weight_size"] = _human_size(path.stat().st_size)
+            break
+    return meta
+
+
+def _readme_banner(meta: dict) -> str:
+    title = meta.get("title") or meta.get("source") or "Model"
+    source = meta.get("source")
+    tag = meta.get("tag") or title
+    weight_file = meta.get("weight_file", "model.q4nx")
+    modality = meta.get("modality", "language")
+
+    parts = [f"# {title}", ""]
+    if source and meta.get("source_url"):
+        parts.append(
+            f"**FastFlowLM Q4NX conversion of [`{source}`]({meta['source_url']})** "
+            "for AMD XDNA NPU inference."
+        )
+    elif source:
+        parts.append(f"**FastFlowLM Q4NX conversion of `{source}`** for AMD XDNA NPU inference.")
+    else:
+        parts.append("**FastFlowLM Q4NX model** for AMD XDNA NPU inference.")
+    parts += [
+        "",
+        "This repository contains a quantized **Q4NX** port of the model, compiled for the "
+        "FastFlowLM (FLM) runtime. It is **not** a GGUF file.",
+        "",
+        "| Item | Value |",
+        "|------|-------|",
+    ]
+    rows = []
+    if source and meta.get("source_url"):
+        rows.append(f"| Source model | [`{source}`]({meta['source_url']}) |")
+    elif source:
+        rows.append(f"| Source model | `{source}` |")
+    if meta.get("weight_size"):
+        rows.append(f"| Weights | `{weight_file}` ({meta['weight_size']}) |")
+    rows.append(f"| Modality | {modality} |")
+    if meta.get("flm_version"):
+        rows.append(f"| FLM version | `{meta['flm_version']}` |")
+    if meta.get("date"):
+        rows.append(f"| Converted | {meta['date']} |")
+    parts.append("\n".join(rows))
+    parts += [
+        "",
+        "## Usage",
+        "",
+        "Run it with FastFlowLM:",
+        "",
+        "```bash",
+        f"flm run {tag}",
+        "",
+        "# or serve it as an OpenAI-compatible endpoint:",
+        f"flm serve {tag}",
+        "```",
+        "",
+        "## Files",
+        "",
+        "| File | Description |",
+        "|------|-------------|",
+    ]
+    file_rows = []
+    if "language" in modality or modality == "language":
+        file_rows.append(("model.q4nx", "Quantized weights (Q8_0 / Q4_1 / BF16)"))
+    if "vision" in modality:
+        file_rows.append(("vision_weight.q4nx", "Vision encoder weights"))
+    if "audio" in modality:
+        file_rows.append(("audio_weight.q4nx", "Audio encoder weights"))
+    file_rows += [
+        ("config.json", "FLM runtime configuration"),
+        ("tokenizer.json", "Tokenizer vocabulary"),
+        ("tokenizer_config.json", "Tokenizer configuration"),
+        ("chat_template.jinja", "Chat template"),
+    ]
+    parts.append("\n".join(f"| `{name}` | {desc} |" for name, desc in file_rows))
+    return "\n".join(parts) + "\n\n"
+
+
+def _adapt_source_readme(text: str) -> str:
+    """Trim a source model card so it slots under our banner (single H1)."""
+    text = text.lstrip("\ufeff \t\r\n")
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            text = text[end + 4:].lstrip("\n")
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.match(r"^#\s", line):
+            lines[i] = "#" + line
+            break
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def generate_readme(readme_text: Optional[str], meta: dict) -> str:
+    parts = [_readme_banner(meta)]
+    if readme_text:
+        parts.append("---\n\n## Source model card\n\n" + _adapt_source_readme(readme_text))
+    else:
+        parts.append(
+            "---\n\n*Original model card not included; see the source repository for details.*\n"
+        )
+    return "\n".join(parts)
+
+
+def assemble_readme(output_dir: Path, candidates: List[str], meta: dict) -> None:
+    """Generate a Q4NX-appropriate README.md in the output directory.
+
+    The banner is rendered from conversion metadata; the body is the source
+    repo's model card, adapted so this repo keeps a single top-level title.
+    """
+    filtered = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        src = _source_dir_for_candidate(candidate)
+        if src is not None and src.resolve() == output_dir.resolve():
+            continue
+        filtered.append(candidate)
+    source_id, readme_text = _fetch_source_readme(filtered)
+    if source_id and not meta.get("source"):
+        meta["source"] = source_id
+        meta["source_url"] = _source_link(source_id)
+    if readme_text:
+        print(f"[INFO] Writing README.md based on {source_id}'s model card")
+    else:
+        print("[INFO] No source model card found; writing a minimal README.md")
+    (output_dir / "README.md").write_text(generate_readme(readme_text, meta), encoding="utf-8")
 
 
 def generate_config_from_gguf(reader) -> dict:
@@ -514,6 +724,8 @@ def assemble_model_assets_hf(
 
     ensure_hf_tokenizer_ids(output_dir)
 
+    assemble_readme(output_dir, [candidate], build_readme_meta(output_dir, flm_version))
+
     print(f"[INFO] Model directory ready: {output_dir}")
 
 
@@ -583,5 +795,7 @@ def assemble_model_assets(
         if chat_template:
             print("[INFO] Writing chat_template.jinja from GGUF metadata.")
             chat_template_path.write_text(chat_template, encoding="utf-8")
+
+    assemble_readme(output_dir, candidates, build_readme_meta(output_dir, flm_version))
 
     print(f"[INFO] Model directory ready: {output_dir}")

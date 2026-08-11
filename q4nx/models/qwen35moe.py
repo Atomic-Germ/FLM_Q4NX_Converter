@@ -306,7 +306,8 @@ class Qwen35Moe(__Q4NX_Converter, model_arch=ModelArch.QWEN35MOE):
 
         # --- quantized 2D weights ---
         # Linear-attn mats need the same llama.cpp untile as dense qwen35.
-        # Full-attn q/k/v/o in GGUF are already HF-ordered (no q_proj reorder).
+        # Full-attn q in GGUF is HF-ordered (g p h); the engine wants (p g h)
+        # (matches the dense converter and the official Q4NX layout).
         if rest == "attn_qkv.weight":
             w0, w1 = w.chunk(2, dim=0)
             w = torch.cat([w0, self._untile_linear_rows(w1)], dim=0).contiguous()
@@ -321,6 +322,7 @@ class Qwen35Moe(__Q4NX_Converter, model_arch=ModelArch.QWEN35MOE):
             self._store_q(prefix + "linear_attn.ssm_out_proj.weight", w)
             return
         if rest == "attn_q.weight":
+            w = rearrange(w, "(g p h) c -> (p g h) c", p=self.Q_PROJ_P, h=self.HEAD_DIM).contiguous()
             self._store_q(prefix + "self_attn.q_proj.weight", w)
             return
         if rest == "attn_k.weight":

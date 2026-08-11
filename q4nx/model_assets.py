@@ -392,8 +392,53 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
     """
     text_config = config.pop("text_config", None)
     if isinstance(text_config, dict):
+        # Flatten text_config over top-level so LM_Config sees hidden_size etc.
+        # Prefer text_config values (Ornith/VL wrappers put real LM hyperparams there).
         for key, value in text_config.items():
-            config.setdefault(key, value)
+            if key in ("model_type",) or config.get(key) in (None, ""):
+                config[key] = value
+            else:
+                config.setdefault(key, value)
+        # Darwin-style text-only MoE: model_type becomes qwen3_5_moe_text.
+        if text_config.get("model_type"):
+            config["model_type"] = text_config["model_type"]
+    # Drop HF vision blob when no vision weights were converted (text-only finetunes).
+    if not (output_dir / "vision_weight.q4nx").exists():
+        config.pop("vision_model_weight", None)
+        # Keep Darwin parity: pure language configs omit nested vision_config.
+        if config.get("model_type") in (
+            "qwen3_5_moe_text", "qwen3_6_moe_text"
+        ) or "text_config" not in config:
+            # If original was a VL wrapper with nested text_config already popped,
+            # strip unused vision_config so FLM stays text-only.
+            vc = config.get("vision_config")
+            if isinstance(vc, dict) and "vision_mm_engine_xclbin_name" not in vc:
+                config.pop("vision_config", None)
+
+    # qwen3.5/3.6 MoE: only moe_intermediate_size is declared upstream, but the
+    # runtime LM_Config requires intermediate_size (== moe_intermediate_size).
+    if (
+        config.get("model_type") in (
+            "qwen3_5_moe_text", "qwen3_5_moe", "qwen3_6_moe", "qwen3_6_moe_text"
+        )
+        and "moe_intermediate_size" in config
+        and "intermediate_size" not in config
+    ):
+        config["intermediate_size"] = config["moe_intermediate_size"]
+    # Engine memory-layout offsets (lm_config.hpp JSON_GETs addr_* with default 0).
+    # Architecture-level, declared in the arch config. Darwin worked without them
+    # on some FLM builds; still inject when present so MHA layouts are correct.
+    for key in ("addr_qk", "addr_kv", "addr_kk", "addr_l_begin_mha", "addr_l_end_mha"):
+        if key in q4nx_config:
+            config.setdefault(key, q4nx_config[key])
+    # Token ids: prefer text_config / generation defaults used by Darwin.
+    if config.get("bos_token_id") is None and config.get("pad_token_id") is not None:
+        config["bos_token_id"] = config["pad_token_id"]
+    if config.get("eos_token_id") is None:
+        config["eos_token_id"] = 248044
+    # Darwin/Ornith engines need caching enabled at runtime.
+    if config.get("model_type") in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
+        config["use_cache"] = True
     if flm_version:
         config["flm_version"] = flm_version
     vision_config = q4nx_config.get("vision_config", {})
@@ -463,12 +508,6 @@ def assemble_model_assets_hf(
             config = json.load(f)
     else:
         config = {}
-    if (
-        config.get("model_type") in ("qwen3_5_moe_text", "qwen3_5_moe")
-        and "moe_intermediate_size" in config
-        and "intermediate_size" not in config
-    ):
-        config["intermediate_size"] = config["moe_intermediate_size"]
     inject_flm_keys(config, q4nx_config, output_dir, flm_version)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)

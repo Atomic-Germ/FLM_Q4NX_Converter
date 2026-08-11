@@ -6,26 +6,45 @@ from q4nx import create_converter, create_hf_converter
 from q4nx.model_assets import assemble_model_assets, assemble_model_assets_hf, get_default_flm_version
 
 
+def is_hf_repo_id(path: str) -> bool:
+    """HF hub repo id like 'org/name' (not a local path, not a .gguf)."""
+    if not path or path.endswith(".gguf") or os.path.exists(path):
+        return False
+    if path.startswith(("http://", "https://", "file:")):
+        return False
+    # org/name with no filesystem separators beyond the single slash
+    parts = path.split("/")
+    return len(parts) == 2 and all(parts) and "\\" not in path
+
+
 def is_hf_source(path: str) -> bool:
     if os.path.isdir(path):
         return (
             os.path.exists(os.path.join(path, "model.safetensors"))
             or os.path.exists(os.path.join(path, "model.safetensors.index.json"))
         )
-    return False
+    return is_hf_repo_id(path)
 
 
 def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None):
     if flm_version is None:
         flm_version = get_default_flm_version()
+    # The weight source is always -i: an HF dir / repo id (Darwin-style HF
+    # path) or a GGUF. --source-model only supplies tokenizer/config assets and
+    # is never treated as a weight source, so it can't trigger a weights
+    # download when converting from GGUF.
+    hf_input = None
     if is_hf_source(gguf_path):
-        model = create_hf_converter(gguf_path, override_model_arch)
+        hf_input = gguf_path
+
+    if hf_input is not None:
+        model = create_hf_converter(hf_input, override_model_arch)
         model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
         assemble_model_assets_hf(
             model.hf_source,
             model.q4nx_config,
             q4nx_path,
-            source_model=source_model,
+            source_model=source_model or hf_input,
             flm_version=flm_version,
         )
     else:
@@ -92,10 +111,10 @@ def main():
     # Determine output folder (prioritize flag, then positional)
     output_folder = args.output_flag or args.output_folder
     
-    # Check if input file exists
-    if not os.path.exists(input_path):
+    # Local paths must exist; HF repo ids are resolved later by the converter.
+    if not is_hf_repo_id(input_path) and not os.path.exists(input_path):
         parser.error(f'Input file does not exist: {input_path}')
-    
+
     # Create output directory if it doesn't exist
     output_dir = os.path.dirname(output_folder)
     if output_dir and not os.path.exists(output_dir):

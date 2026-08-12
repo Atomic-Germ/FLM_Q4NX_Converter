@@ -17,6 +17,17 @@ def is_hf_repo_id(path: str) -> bool:
     return len(parts) == 2 and all(parts) and "\\" not in path
 
 
+def is_hf_repo_id(path: str) -> bool:
+    """HF hub repo id like 'org/name' (not a local path, not a .gguf)."""
+    if not path or path.endswith(".gguf") or os.path.exists(path):
+        return False
+    if path.startswith(("http://", "https://", "file:")):
+        return False
+    # org/name with no filesystem separators beyond the single slash
+    parts = path.split("/")
+    return len(parts) == 2 and all(parts) and "\\" not in path
+
+
 def is_hf_source(path: str) -> bool:
     if os.path.isdir(path):
         return (
@@ -147,51 +158,4 @@ def main():
 if __name__ == "__main__":
     # for debug, give the path and ouptut path here by directly set the command line args
     import sys
-    # sys.argv = ['convert.py', '-i', 'unsloth_gpt-oss-20b-Q4_0.gguf', '-o', 'unsloth-gotoss20b-q40']
-            
-    # sys.argv = ['convert.py', '-i', 'unsloth_gpt-oss-20b-Q4_1.gguf', '-o', 'unsloth-gotoss20b-q41']            
-            
-    # import sys
-    # # sys.argv = ['convert.py', '-i', 'gemma-3-4b-it-Q4_1.gguf', '-o', 'unsloth-gemma3-q41']    
-    # # main()
-
-
-    # # sys.argv = ['convert.py', '-i', 'gemma3-mmproj-BF16.gguf', '-o', 'unsloth-gemma3-vision', '-t', 'vision']
-    # # main()
-    
-    
-
-    # # sys.argv = ['convert.py', '-i'
-    # , 'medgemma3-mmproj-BF16.gguf', '-o', 'unsloth-medgemma3-vision', '-t', 'vision']
-    # # main()
-    # sys.argv = ['convert.py', '-i', 'Qwen3-VL-4B-Instruct-Q4_1.gguf', '-o', 'unsloth-qwen3vl-4b-q41' ]
-    # main()             
-    
-    # sys.argv = ['convert.py', '-i', 'Qwen3-4B-Q4_1.gguf', '-o', 'unsloth-qwen3-4b-q41' ]
-    # main()                 
-    # sys.argv = ['convert.py', '-i', 'qwen3vl-4b-mmproj-BF16.gguf', '-o', 'unsloth-qwen3vl-vision', '-t', 'vision']
-    # main()        
-    
-    
-    
-    #sys.argv = ['convert.py', '-i', 'qwen3_5vl-4b-mmproj-BF16.gguf', '-o', 'unsloth-qwen3_5vl-vision', '-t', 'vision']
-     
-    #sys.argv = ['convert.py', '-i', 'qwen3_5vl-9bmmproj-BF16.gguf', '-o', 'unsloth-qwen3_5_9bvl-vision', '-t', 'vision'] 
-    
-    
-    #sys.argv = ['convert.py', '-i', 'Qwen3.5-4B-Q4_1.gguf', '-o', 'unsloth-qwen3_5_4bq41'] 
-    
-    #sys.argv = ['convert.py', '-i', 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf', '-o', 'unsloth-qwen3_59b_uncensored', "-f", "qwen3.5-9B"]     
-    # sys.argv = ['convert.py', '-i', 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf', '-o', 'unsloth-qwen3_59b_uncensored', "-f", "qwen3.5-9B"]     
-    
-    # sys.argv = ['convert.py', '-i', 'Qwen3.5-9B-Q4_1.gguf', '-o', 'unsloth-qwen3_5_9bq41']     
-    
-    
-    
-    #sys.argv = ['convert.py', '-i', 'gemma-4-E2B-it-Q4_1.gguf', '-o', 'unsloth-gemma4-2b-it-q41']    
-    
-    #sys.argv = ['convert.py', '-i', 'gemma4-2b-mmproj.gguf', '-o', 'unsloth-gemma4-2b-vision', '-t', 'vision']     
-    
-    #sys.argv = ['convert.py', '-i', 'gemma4-2b-mmproj.gguf', '-o', 'unsloth-gemma4-2b-audio', '-t', 'audio']         
-    # sys.argv = ['convert.py', '-i', 'debug_gemma4e2b_model.gguf', '-o', 'debug-gemma4-2b-audio', '-t', 'audio', '-f', 'gemma4']           
-    main()
+main()

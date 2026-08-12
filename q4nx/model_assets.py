@@ -3,8 +3,9 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 ASSET_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
 REQUIRED_ASSETS = ["config.json", "tokenizer.json", "tokenizer_config.json"]
@@ -81,10 +82,18 @@ def read_provenance(reader) -> dict:
 
 
 def resolve_repo_candidates(reader, source_arg: Optional[str]) -> List[str]:
-    """Ordered list of repo ids to try, from an explicit source then GGUF provenance."""
+    """Ordered list of repos/local dirs to try for non-GGUF assets.
+
+    An explicit -s source is always tried first (repo id or local dir): the
+    GGUF's own repo often only ships weights, so tokenizer/config assets are
+    pulled from the -s source whenever one is given. GGUF provenance follows.
+    """
     candidates: List[str] = []
-    if source_arg and "/" in source_arg and not os.path.exists(source_arg):
-        candidates.append(source_arg)
+    if source_arg:
+        if os.path.exists(source_arg):
+            candidates.append(source_arg)  # explicit local dir
+        elif "/" in source_arg:
+            candidates.append(source_arg)  # explicit repo id
     provenance = read_provenance(reader)
     for base in provenance["base_models"]:
         rid = base.get("repository") or _repo_id_from_url(base.get("repo_url"))
@@ -172,6 +181,104 @@ def _hf_download_file(repo_id: str, filename: str) -> Optional[str]:
         return None
 
 
+# Quantized GGUF preference order when -i names an HF repo instead of a file.
+GGUF_QUANT_PRIORITY: Tuple[str, ...] = ("q4_1", "q4_0", "q8_0")
+
+
+def find_repo_gguf(repo_id: str) -> Optional[Tuple[str, str]]:
+    """Search an HF repo for a quantized GGUF: q4_1, then q4_0, then q8_0.
+
+    Returns (local_path, repo_filename) using the HF cache (downloading if
+    needed), or None if the repo has no matching GGUF.
+    """
+    try:
+        from huggingface_hub import list_repo_files
+    except ImportError:
+        print("[WARN] huggingface_hub not installed; cannot search HF repos for a GGUF")
+        return None
+    try:
+        files = list_repo_files(repo_id)
+    except Exception as e:
+        print(f"[WARN] Could not list files in {repo_id}: {e}")
+        return None
+
+    matches = []  # (priority_index, filename)
+    other_ggufs = []
+    for fname in files:
+        if not fname.lower().endswith(".gguf"):
+            continue
+        low = os.path.basename(fname).lower()
+        found = next(
+            (q for q in GGUF_QUANT_PRIORITY if q in low), None
+        )
+        if found is not None:
+            matches.append((GGUF_QUANT_PRIORITY.index(found), fname))
+        else:
+            other_ggufs.append(fname)
+    if not matches:
+        if other_ggufs:
+            print(
+                f"[WARN] No {', '.join(GGUF_QUANT_PRIORITY)} GGUF in {repo_id}; "
+                f"only found: {', '.join(sorted(other_ggufs))}"
+            )
+        return None
+
+    _, filename = sorted(matches, key=lambda m: (m[0], m[1].lower()))[0]
+    print(f"[INFO] Found GGUF in {repo_id}: {filename}")
+    path = _hf_download_file(repo_id, filename)
+    if path is None:
+        return None
+    return path, filename
+
+
+def fetch_hf_repo_info(repo_id: str) -> dict:
+    """Fetch HF repo metadata for README enrichment; {} if unavailable/offline."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return {}
+    try:
+        info = HfApi().model_info(repo_id)
+    except Exception as e:
+        print(f"[WARN] Could not fetch repo info for {repo_id}: {e}")
+        return {}
+    card = getattr(info, "cardData", None) or {}
+    config = getattr(info, "config", None) or {}
+    quant_cfg = config.get("quantization_config") or {}
+    result = {}
+    sha = getattr(info, "sha", None)
+    if sha:
+        result["sha"] = sha
+    downloads = getattr(info, "downloads", None)
+    if downloads:
+        result["downloads"] = downloads
+    tags = getattr(info, "tags", None) or []
+    if tags:
+        result["tags"] = tags
+    license = getattr(info, "license", None) or card.get("license")
+    if license:
+        result["license"] = license
+    library = getattr(info, "library_name", None)
+    if library:
+        result["library"] = library
+    pipeline = getattr(info, "pipeline_tag", None)
+    if pipeline:
+        result["pipeline_tag"] = pipeline
+    base_model = card.get("base_model")
+    if base_model:
+        result["base_model"] = base_model
+    language = card.get("language")
+    if language:
+        result["language"] = language
+    if config.get("model_type"):
+        result["model_type"] = config["model_type"]
+    if config.get("architectures"):
+        result["architectures"] = config["architectures"]
+    if quant_cfg.get("quant_method"):
+        result["quant_method"] = quant_cfg["quant_method"]
+    return result
+
+
 def _source_dir_for_candidate(candidate: str) -> Optional[Path]:
     """Resolve a candidate (local dir or repo id) to a directory holding model files."""
     if os.path.isdir(candidate):
@@ -202,6 +309,259 @@ def _fetch_assets(candidate: str, output_dir: Path, files: List[str]) -> List[st
             print(f"[INFO] Downloaded model assets from {candidate}")
         return downloaded
     return []
+
+
+# ---------------------------------------------------------------------------
+# README generation
+# ---------------------------------------------------------------------------
+
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} B"
+            return f"{size:.2f} {unit}".rstrip("0").rstrip(".")
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def _read_source_file(candidate: str, filename: str) -> Optional[str]:
+    """Read a text file (e.g. README.md) from a candidate repo, without writing it."""
+    source_dir = _source_dir_for_candidate(candidate)
+    if source_dir is not None:
+        path = source_dir / filename
+        if path.is_file():
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return None
+    if "/" in candidate:
+        path = _hf_download_file(candidate, filename)
+        if path:
+            try:
+                return Path(path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return None
+    return None
+
+
+def _fetch_source_readme(candidates: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (source_id, readme_text) for the first candidate with a README.md."""
+    for candidate in candidates:
+        if not candidate:
+            continue
+        text = _read_source_file(candidate, "README.md")
+        if text:
+            return candidate, text
+    return None, None
+
+
+def _source_link(source: str) -> Optional[str]:
+    """HF model-card URL for a repo id, None for local paths / non-repo strings."""
+    if not source or os.path.isdir(source) or source.startswith(("/", ".", "\\")):
+        return None
+    parts = source.split("/")
+    if len(parts) == 2 and all(parts) and "\\" not in source:
+        return f"https://huggingface.co/{source}"
+    return None
+
+
+def _modality_label(output_dir: Path) -> str:
+    labels = []
+    if (output_dir / "model.q4nx").is_file():
+        labels.append("language")
+    if (output_dir / "vision_weight.q4nx").is_file():
+        labels.append("vision")
+    if (output_dir / "audio_weight.q4nx").is_file():
+        labels.append("audio")
+    return " / ".join(labels) or "language"
+
+
+def build_readme_meta(output_dir: Path, flm_version: Optional[str]) -> dict:
+    """Gather conversion metadata used to render the README banner."""
+    meta = {
+        "title": output_dir.name or None,
+        "tag": output_dir.name,
+        "modality": _modality_label(output_dir),
+        "flm_version": flm_version,
+        "date": date.today().isoformat(),
+    }
+    for filename in ("model.q4nx", "vision_weight.q4nx", "audio_weight.q4nx"):
+        path = output_dir / filename
+        if path.is_file():
+            meta["weight_file"] = filename
+            meta["weight_size"] = _human_size(path.stat().st_size)
+            break
+    return meta
+
+
+def _readme_banner(meta: dict) -> str:
+    title = meta.get("title") or meta.get("source") or "Model"
+    source = meta.get("source")
+    tag = meta.get("tag") or title
+    weight_file = meta.get("weight_file", "model.q4nx")
+    modality = meta.get("modality", "language")
+
+    parts = [f"# {title}", ""]
+    if source and meta.get("source_url"):
+        parts.append(
+            f"**FastFlowLM Q4NX conversion of [`{source}`]({meta['source_url']})** "
+            "for AMD XDNA NPU inference."
+        )
+    elif source:
+        parts.append(f"**FastFlowLM Q4NX conversion of `{source}`** for AMD XDNA NPU inference.")
+    else:
+        parts.append("**FastFlowLM Q4NX model** for AMD XDNA NPU inference.")
+    parts += [
+        "",
+        "This repository contains a quantized **Q4NX** port of the model, compiled for the "
+        "FastFlowLM (FLM) runtime. It is **not** a GGUF file.",
+        "",
+        "| Item | Value |",
+        "|------|-------|",
+    ]
+    rows = []
+    if source and meta.get("source_url"):
+        rows.append(f"| Source model | [`{source}`]({meta['source_url']}) |")
+    elif source:
+        rows.append(f"| Source model | `{source}` |")
+    if meta.get("source_file"):
+        rows.append(f"| Source GGUF | `{meta['source_file']}` |")
+    if meta.get("weight_size"):
+        rows.append(f"| Weights | `{weight_file}` ({meta['weight_size']}) |")
+    rows.append(f"| Modality | {modality} |")
+    if meta.get("flm_version"):
+        rows.append(f"| FLM version | `{meta['flm_version']}` |")
+    if meta.get("date"):
+        rows.append(f"| Converted | {meta['date']} |")
+    parts.append("\n".join(rows))
+
+    repo_rows = []
+    if meta.get("license"):
+        repo_rows.append(f"| License | {meta['license']} |")
+    if meta.get("base_model"):
+        repo_rows.append(f"| Base model | `{meta['base_model']}` |")
+    if meta.get("library"):
+        repo_rows.append(f"| Library | `{meta['library']}` |")
+    if meta.get("model_type"):
+        repo_rows.append(f"| Model type | `{meta['model_type']}` |")
+    if meta.get("pipeline_tag"):
+        repo_rows.append(f"| Pipeline | `{meta['pipeline_tag']}` |")
+    if meta.get("quant_method"):
+        repo_rows.append(f"| Upstream quant method | `{meta['quant_method']}` |")
+    if meta.get("downloads"):
+        repo_rows.append(f"| Downloads | {meta['downloads']:,} |")
+    if meta.get("sha"):
+        repo_rows.append(f"| Repo revision | `{meta['sha']}` |")
+    if repo_rows:
+        parts += [
+            "",
+            "## Source repository",
+            "",
+            "Metadata from the upstream Hugging Face repository:",
+            "",
+            "| Item | Value |",
+            "|------|-------|",
+            "\n".join(repo_rows),
+            "",
+        ]
+    parts += [
+        "",
+        "## Usage",
+        "",
+        "Run it with FastFlowLM:",
+        "",
+        "```bash",
+        f"flm run {tag}",
+        "",
+        "# or serve it as an OpenAI-compatible endpoint:",
+        f"flm serve {tag}",
+        "```",
+        "",
+        "## Files",
+        "",
+        "| File | Description |",
+        "|------|-------------|",
+    ]
+    file_rows = []
+    if "language" in modality or modality == "language":
+        file_rows.append(("model.q4nx", "Quantized weights (Q8_0 / Q4_1 / BF16)"))
+    if "vision" in modality:
+        file_rows.append(("vision_weight.q4nx", "Vision encoder weights"))
+    if "audio" in modality:
+        file_rows.append(("audio_weight.q4nx", "Audio encoder weights"))
+    file_rows += [
+        ("config.json", "FLM runtime configuration"),
+        ("tokenizer.json", "Tokenizer vocabulary"),
+        ("tokenizer_config.json", "Tokenizer configuration"),
+        ("chat_template.jinja", "Chat template"),
+    ]
+    parts.append("\n".join(f"| `{name}` | {desc} |" for name, desc in file_rows))
+    return "\n".join(parts) + "\n\n"
+
+
+def _adapt_source_readme(text: str) -> str:
+    """Trim a source model card so it slots under our banner (single H1)."""
+    text = text.lstrip("\ufeff \t\r\n")
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            text = text[end + 4:].lstrip("\n")
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.match(r"^#\s", line):
+            lines[i] = "#" + line
+            break
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def generate_readme(readme_text: Optional[str], meta: dict) -> str:
+    parts = [_readme_banner(meta)]
+    if readme_text:
+        parts.append("---\n\n## Source model card\n\n" + _adapt_source_readme(readme_text))
+    else:
+        parts.append(
+            "---\n\n*Original model card not included; see the source repository for details.*\n"
+        )
+    return "\n".join(parts)
+
+
+def assemble_readme(
+    output_dir: Path,
+    candidates: List[str],
+    meta: dict,
+    source_file: Optional[str] = None,
+) -> None:
+    """Generate a Q4NX-appropriate README.md in the output directory.
+
+    The banner is rendered from conversion metadata; the body is the source
+    repo's model card, adapted so this repo keeps a single top-level title.
+    When the source resolves to an HF repo id, its metadata (license, base
+    model, downloads, revision, ...) is fetched and added to the banner.
+    """
+    filtered = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        src = _source_dir_for_candidate(candidate)
+        if src is not None and src.resolve() == output_dir.resolve():
+            continue
+        filtered.append(candidate)
+    source_id, readme_text = _fetch_source_readme(filtered)
+    if source_id and not meta.get("source"):
+        meta["source"] = source_id
+        meta["source_url"] = _source_link(source_id)
+    if source_file and not meta.get("source_file"):
+        meta["source_file"] = source_file
+    if source_id and _source_link(source_id):
+        for key, value in fetch_hf_repo_info(source_id).items():
+            meta.setdefault(key, value)
+    if readme_text:
+        print(f"[INFO] Writing README.md based on {source_id}'s model card")
+    else:
+        print("[INFO] No source model card found; writing a minimal README.md")
+    (output_dir / "README.md").write_text(generate_readme(readme_text, meta), encoding="utf-8")
 
 
 def generate_config_from_gguf(reader) -> dict:
@@ -392,8 +752,53 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
     """
     text_config = config.pop("text_config", None)
     if isinstance(text_config, dict):
+        # Flatten text_config over top-level so LM_Config sees hidden_size etc.
+        # Prefer text_config values (Ornith/VL wrappers put real LM hyperparams there).
         for key, value in text_config.items():
-            config.setdefault(key, value)
+            if key in ("model_type",) or config.get(key) in (None, ""):
+                config[key] = value
+            else:
+                config.setdefault(key, value)
+        # Darwin-style text-only MoE: model_type becomes qwen3_5_moe_text.
+        if text_config.get("model_type"):
+            config["model_type"] = text_config["model_type"]
+    # Drop HF vision blob when no vision weights were converted (text-only finetunes).
+    if not (output_dir / "vision_weight.q4nx").exists():
+        config.pop("vision_model_weight", None)
+        # Keep Darwin parity: pure language configs omit nested vision_config.
+        if config.get("model_type") in (
+            "qwen3_5_moe_text", "qwen3_6_moe_text"
+        ) or "text_config" not in config:
+            # If original was a VL wrapper with nested text_config already popped,
+            # strip unused vision_config so FLM stays text-only.
+            vc = config.get("vision_config")
+            if isinstance(vc, dict) and "vision_mm_engine_xclbin_name" not in vc:
+                config.pop("vision_config", None)
+
+    # qwen3.5/3.6 MoE: only moe_intermediate_size is declared upstream, but the
+    # runtime LM_Config requires intermediate_size (== moe_intermediate_size).
+    if (
+        config.get("model_type") in (
+            "qwen3_5_moe_text", "qwen3_5_moe", "qwen3_6_moe", "qwen3_6_moe_text"
+        )
+        and "moe_intermediate_size" in config
+        and "intermediate_size" not in config
+    ):
+        config["intermediate_size"] = config["moe_intermediate_size"]
+    # Engine memory-layout offsets (lm_config.hpp JSON_GETs addr_* with default 0).
+    # Architecture-level, declared in the arch config. Darwin worked without them
+    # on some FLM builds; still inject when present so MHA layouts are correct.
+    for key in ("addr_qk", "addr_kv", "addr_kk", "addr_l_begin_mha", "addr_l_end_mha"):
+        if key in q4nx_config:
+            config.setdefault(key, q4nx_config[key])
+    # Token ids: prefer text_config / generation defaults used by Darwin.
+    if config.get("bos_token_id") is None and config.get("pad_token_id") is not None:
+        config["bos_token_id"] = config["pad_token_id"]
+    if config.get("eos_token_id") is None:
+        config["eos_token_id"] = 248044
+    # Darwin/Ornith engines need caching enabled at runtime.
+    if config.get("model_type") in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
+        config["use_cache"] = True
     if flm_version:
         config["flm_version"] = flm_version
     vision_config = q4nx_config.get("vision_config", {})
@@ -438,6 +843,7 @@ def assemble_model_assets_hf(
     output_dir: str,
     source_model: Optional[str] = None,
     flm_version: Optional[str] = None,
+    source_file: Optional[str] = None,
 ) -> None:
     """Build a complete model directory from an HF safetensors source.
 
@@ -463,17 +869,15 @@ def assemble_model_assets_hf(
             config = json.load(f)
     else:
         config = {}
-    if (
-        config.get("model_type") in ("qwen3_5_moe_text", "qwen3_5_moe")
-        and "moe_intermediate_size" in config
-        and "intermediate_size" not in config
-    ):
-        config["intermediate_size"] = config["moe_intermediate_size"]
     inject_flm_keys(config, q4nx_config, output_dir, flm_version)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
     ensure_hf_tokenizer_ids(output_dir)
+
+    assemble_readme(
+        output_dir, [candidate], build_readme_meta(output_dir, flm_version), source_file
+    )
 
     print(f"[INFO] Model directory ready: {output_dir}")
 
@@ -484,6 +888,7 @@ def assemble_model_assets(
     output_dir: str,
     source_model: Optional[str] = None,
     flm_version: Optional[str] = None,
+    source_file: Optional[str] = None,
 ) -> None:
     """Build a complete, uploadable model directory.
 
@@ -544,5 +949,7 @@ def assemble_model_assets(
         if chat_template:
             print("[INFO] Writing chat_template.jinja from GGUF metadata.")
             chat_template_path.write_text(chat_template, encoding="utf-8")
+
+    assemble_readme(output_dir, candidates, build_readme_meta(output_dir, flm_version), source_file)
 
     print(f"[INFO] Model directory ready: {output_dir}")

@@ -64,16 +64,8 @@ FAMILY_ALIASES = [
     ("qwen2vl", "qwen2vl"),
     ("qwen2", "qwen2"),
     ("gemma4", "gemma4e"),
-    ("gemma-4", "gemma4e"),
     ("gemma3", "gemma3"),
     ("llama3", "llama3"),
-    ("llama", "llama3"),
-    ("granite", "llama3"),
-    ("crow", "qwen3.5"),
-    ("huihui", "qwen3.5"),
-    ("qwythos", "qwen3.5"),
-    ("qwopus", "qwen3.5"),
-    ("darwin", "qwen3.6-moe"),
     ("deepseek-r1-0528", "deepseek-r1-0528"),
     ("deepseek-r1", "deepseek-r1"),
     ("deepseek", "deepseek-r1"),
@@ -172,9 +164,7 @@ def _strip_npu2(name):
 
 
 def _extract_size(bare):
-    # Trailing size groups like "-A3B" (Qwen3.6-35B-A3B) end in a letter that
-    # the digit group must not swallow (previously "-A3B" -> "35b-a3").
-    m = re.search(r"(\d+(?:\.\d+)?[Bb](?:-[A-Za-z]+\d+(?:\.\d+)?[A-Za-z]*)*)", bare)
+    m = re.search(r"(\d+(?:\.\d+)?[Bb](?:-[A-Za-z]+\d+(?:\.\d+)?)*)", bare)
     if not m:
         return None, bare
     size = m.group(1).lower()

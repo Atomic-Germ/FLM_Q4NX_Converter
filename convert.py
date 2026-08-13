@@ -3,7 +3,18 @@ import argparse
 import os
 from pathlib import Path
 from q4nx import create_converter, create_hf_converter
-from q4nx.model_assets import assemble_model_assets, assemble_model_assets_hf, get_default_flm_version
+from q4nx.model_assets import assemble_model_assets, assemble_model_assets_hf, get_default_flm_version, find_repo_gguf
+
+
+def is_hf_repo_id(path: str) -> bool:
+    """HF hub repo id like 'org/name' (not a local path, not a .gguf)."""
+    if not path or path.endswith(".gguf") or os.path.exists(path):
+        return False
+    if path.startswith(("http://", "https://", "file:")):
+        return False
+    # org/name with no filesystem separators beyond the single slash
+    parts = path.split("/")
+    return len(parts) == 2 and all(parts) and "\\" not in path
 
 
 def is_hf_source(path: str) -> bool:
@@ -12,24 +23,59 @@ def is_hf_source(path: str) -> bool:
             os.path.exists(os.path.join(path, "model.safetensors"))
             or os.path.exists(os.path.join(path, "model.safetensors.index.json"))
         )
-    return False
+    return is_hf_repo_id(path)
 
 
-def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None):
+def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, embed_source: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None):
     if flm_version is None:
         flm_version = get_default_flm_version()
-    if is_hf_source(gguf_path):
-        model = create_hf_converter(gguf_path, override_model_arch)
+    # Three distinct source roles may be in play:
+    #   -i <gguf or hf-repo-id>          : the weight source being converted.
+    #   -s/--source-model <hf-repo-id>   : the asset repo (config.json,
+    #                                       tokenizer*, README, chat_template).
+    #                                       Distinct from the weight source.
+    #   -e/--embed-source <hf-repo-id>   : the original-BF16 safetensors repo
+    #                                       used to override the (lossy)
+    #                                       GGUF-dequantized embed_tokens.weight
+    #                                       for re-quantized GGUF sources.
+    # --source-model only supplies tokenizer/config assets and is never treated
+    # as a weight source, so it can't trigger a weights download when converting
+    # from GGUF; --embed-source only fetches the single embed shard.
+    #
+    # New: -i <hf-repo-id> prefers a quantized GGUF shipped in the repo itself
+    # (q4_1, then q4_0, then q8_0), downloading it via the HF cache. If the
+    # repo has none, we fall back to the HF-safetensors source path below.
+    hf_input = None
+    source_file = None
+    if is_hf_repo_id(gguf_path):
+        repo_id = gguf_path
+        found = find_repo_gguf(repo_id)
+        if found is not None:
+            gguf_path, source_file = found
+            source_model = source_model or repo_id
+        else:
+            hf_input = repo_id
+    elif is_hf_source(gguf_path):
+        hf_input = gguf_path
+
+    if hf_input is not None:
+        model = create_hf_converter(hf_input, override_model_arch)
         model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
         assemble_model_assets_hf(
             model.hf_source,
             model.q4nx_config,
             q4nx_path,
-            source_model=source_model,
+            source_model=source_model or hf_input,
             flm_version=flm_version,
+            source_file=source_file,
         )
     else:
         model = create_converter(gguf_path, override_model_arch)
+        # gpt-oss pulls an original BF16 embed from --embed-source to override
+        # the lossy GGUF-dequantized embed; harmless no-op for converters that
+        # don't read embed_source (the attribute is simply ignored).
+        if embed_source is not None and hasattr(model, "embed_source"):
+            model.embed_source = embed_source
         model.convert(q4nx_path=q4nx_path, weights_type=weights_type)
         assemble_model_assets(
             model.gguf_reader,
@@ -37,6 +83,7 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
             q4nx_path,
             source_model=source_model,
             flm_version=flm_version,
+            source_file=source_file,
         )
     if deploy_tag:
         from q4nx.deploy import deploy_model
@@ -52,26 +99,33 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert GGUF or HF-safetensors model files to Q4NX format (output always named model.q4nx)',
+        description='Convert GGUF or HF-safetensors model files to Q4NX format (output always named model.q4nx). '
+                    '-i also accepts an HF repo id: the repo is searched for a q4_1 / q4_0 / q8_0 GGUF (in that order) '
+                    'and that file is downloaded and converted.',
         epilog='Examples:\n'
                '  python convert.py -i model.gguf\n'
                '  python convert.py -i model.gguf -o output_folder\n'
                '  python convert.py model.gguf output_folder\n'
+               '  python convert.py -i Qwen/Qwen3.5-9B -o output_folder     (HF repo: picks a q4_1/q4_0/q8_0 GGUF from it)\n'
                '  python convert.py -i /path/to/hf_model_dir -o output_folder   (HF safetensors source, e.g. Darwin-36B-Opus)\n'
-               '  python convert.py -i vision_model.gguf -o output_folder -t vision',
+               '  python convert.py -i vision_model.gguf -o output_folder -t vision\n'
+               '  python convert.py -i mradermacher/gpt-oss-20b-i1-GGUF -o GPT-OSS-20B-NPU2 \\\n'
+               '       -s FastFlowLM/GPT-OSS-20B-NPU2 -e openai/gpt-oss-20b     (3-repo: GGUF weights -i, assets -s, BF16 embed -e)',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     # Add support for both flag-based and positional arguments
     parser.add_argument('input_file', nargs='?', help='Input GGUF file (positional)')
     parser.add_argument('output_folder', nargs='?', help='Output folder (positional, optional)')
-    parser.add_argument('-i', '--input', dest='input_flag', help='Input GGUF file')
+    parser.add_argument('-i', '--input', dest='input_flag', help='Input GGUF file, or an HF repo id (a q4_1/q4_0/q8_0 GGUF is auto-selected from the repo)')
     parser.add_argument('-o', '--output', dest='output_flag', help='Output folder (optional, defaults to input file directory)')
     parser.add_argument('-t', '--type', dest='weights_type', default='language', help='Type of weights to convert (default: language)',
                         choices=['language', 'vision', 'audio'])
     parser.add_argument('-f', '--force', dest='force_model_type', default="", help="Model type. Empty string for automatic recognition from gguf file")
     parser.add_argument('-s', '--source-model', dest='source_model', default=None,
-                        help="Source HF/ModelScope model for tokenizer/config assets. A local dir, an HF cache repo name, or a repo id like 'Qwen/Qwen3.5-9B'. If omitted, the GGUF's provenance metadata is followed (local HF cache first, then SDK download).")
+                        help="Asset repo: HF repo id or local dir supplying config.json, tokenizer*, README and chat_template (NOT weights). e.g. 'FastFlowLM/GPT-OSS-20B-NPU2'. If omitted, the GGUF's provenance metadata is followed (local HF cache first, then SDK download).")
+    parser.add_argument('-e', '--embed-source', dest='embed_source', default=None,
+                        help="Original-BF16 safetensors repo to override the GGUF-dequantized embed_tokens.weight (only that tensor is fetched, via the safetensors index). HF repo id (e.g. 'openai/gpt-oss-20b'), local dir with model.safetensors(.index.json), or a single .safetensors file. Only needed for re-quantized GGUF sources; ignored by non-gpt-oss converters.")
     parser.add_argument('--flm-version', dest='flm_version', default=None,
                         help="flm_version to write into the generated config.json (default: detected from `flm --version`)" )
     parser.add_argument('-d', '--deploy', dest='deploy_tag', default=None, metavar='NAME:SIZE',
@@ -92,17 +146,17 @@ def main():
     # Determine output folder (prioritize flag, then positional)
     output_folder = args.output_flag or args.output_folder
     
-    # Check if input file exists
-    if not os.path.exists(input_path):
+    # Local paths must exist; HF repo ids are resolved later by the converter.
+    if not is_hf_repo_id(input_path) and not os.path.exists(input_path):
         parser.error(f'Input file does not exist: {input_path}')
-    
+
     # Create output directory if it doesn't exist
     output_dir = os.path.dirname(output_folder)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
     
     print(f"[INFO] Converting {input_path} to {output_folder}...")
-    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, flm_version=args.flm_version, deploy_tag=args.deploy_tag, deploy_from=args.deploy_from, deploy_name=args.deploy_name)
+    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, embed_source=args.embed_source, flm_version=args.flm_version, deploy_tag=args.deploy_tag, deploy_from=args.deploy_from, deploy_name=args.deploy_name)
     print(f"[INFO] Conversion complete! Output saved to {output_folder}")
 
 

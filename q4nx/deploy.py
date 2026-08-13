@@ -274,6 +274,7 @@ def build_registry_entry(
     if isinstance(size, int) and size > 0:
         entry["size"] = size
     entry.setdefault("max_prefill_len", 4096)
+    entry.setdefault("default_context_length", 8192)
     details = entry.setdefault("details", {})
     details.setdefault("format", "NPU2")
     entry["vlm"] = any(name.startswith("vision") for name in deployed_files)

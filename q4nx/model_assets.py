@@ -877,7 +877,7 @@ def inject_flm_keys(config: dict, q4nx_config: dict, output_dir: Path, flm_versi
     if config.get("eos_token_id") is None:
         config["eos_token_id"] = 248044
     # Darwin/Ornith engines need caching enabled at runtime.
-    if config.get("model_type") in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text"):
+    if config.get("model_type") in ("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_6_moe", "qwen3_6_moe_text", "qwen3_omni_moe"):
         config["use_cache"] = True
     if flm_version:
         config["flm_version"] = flm_version

@@ -192,6 +192,10 @@ def main():
     ap.add_argument("--q4nx-dir", required=True)
     ap.add_argument("--ref-gguf", default=None)
     ap.add_argument("--ref-hf", default=None)
+    ap.add_argument(
+        "--ref-hf-prefix", default="model.language_model.",
+        help="HF key prefix for the text stack (omni-moe: model.thinker.text_model.)",
+    )
     ap.add_argument("--limit", default=None, type=int, help="limit float comparisons")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -201,7 +205,12 @@ def main():
     if not q4nx_path.is_file():
         ap.error(f"model.q4nx not found in {q4nx_dir}")
     config = json.loads((q4nx_dir / "config.json").read_text())
-    n_layers = int(config.get("num_hidden_layers") or config.get("n_layer") or 0)
+    n_layers = int(
+        config.get("num_hidden_layers")
+        or (config.get("thinker_config") or {}).get("num_hidden_layers")
+        or (config.get("text_config") or {}).get("num_hidden_layers")
+        or 0
+    )
 
     st = load_file(str(q4nx_path))
     print(f"[INFO] Loaded {len(st)} Q4NX tensors from {q4nx_path}")
@@ -276,8 +285,8 @@ def main():
     g_norm = "model.norm.weight"
     if g_embed in st:
         checked += 1
-        if ref is not None and ref.has("token_embd.weight" if ref.is_gguf else "model.language_model.embed_tokens.weight"):
-            src = "token_embd.weight" if ref.is_gguf else "model.language_model.embed_tokens.weight"
+        if ref is not None and ref.has("token_embd.weight" if ref.is_gguf else args.ref_hf_prefix + "embed_tokens.weight"):
+            src = "token_embd.weight" if ref.is_gguf else args.ref_hf_prefix + "embed_tokens.weight"
             r = ref.get(src).to(torch.bfloat16).contiguous()
             t = st[g_embed]
             if r.shape == t.shape:
@@ -295,8 +304,8 @@ def main():
                 print(f"[CHK] {g_embed}: shape {tuple(t.shape)} vs ref {tuple(r.shape)} (skip)")
     if g_norm in st:
         checked += 1
-        if ref is not None and ref.has("output_norm.weight" if ref.is_gguf else "model.language_model.norm.weight"):
-            src = "output_norm.weight" if ref.is_gguf else "model.language_model.norm.weight"
+        if ref is not None and ref.has("output_norm.weight" if ref.is_gguf else args.ref_hf_prefix + "norm.weight"):
+            src = "output_norm.weight" if ref.is_gguf else args.ref_hf_prefix + "norm.weight"
             r = ref.get(src)
             r = r if ref.is_gguf else (r.float() + 1)
             r = r.to(torch.bfloat16).contiguous()
@@ -321,7 +330,11 @@ def main():
             if ref is not None and ref.is_gguf:
                 src = gguf_src.format(b=bid)
             elif ref is not None:
-                src = f"model.language_model." + hf_src.format(b=bid) if hf_src else None
+                src = args.ref_hf_prefix + hf_src.format(b=bid) if hf_src else None
+                # SRC omits the ".weight" suffix for HF (GGUF keeps it); HF
+                # tensor names are always foo.weight for these float weights.
+                if src and suffix.endswith(".weight") and not src.endswith(".weight"):
+                    src += ".weight"
             else:
                 src = gguf_src.format(b=bid)
             tf = transforms.get(suffix, {}).get("gguf" if (ref is None or ref.is_gguf) else "hf")

@@ -1168,8 +1168,11 @@ def create_hf_converter(
 ) -> __Q4NX_Converter:
     """Factory for HF-safetensors-source converters.
 
-    Only the Qwen3.5 MoE converter supports an HF source for now.
+    Model-arch selection: an explicit ``override_model_arch`` wins; otherwise
+    the arch is sniffed from the repo's config.json ``model_type``/architectures
+    and falls back to Qwen3.5 MoE for legacy calls that pass no hint.
     """
+    model_arch: ModelArch | None = None
     if override_model_arch:
         normalized_override = override_model_arch.replace(":", "-").lower()
         for arch_enum, arch_names in ModelArchNames.items():
@@ -1180,16 +1183,47 @@ def create_hf_converter(
             else:
                 continue
             break
-        else:
-            model_arch = None
-    else:
-        model_arch = ModelArch.QWEN35MOE
+    if model_arch is None:
+        model_arch = _sniff_hf_arch(hf_source)
 
-    if model_arch != ModelArch.QWEN35MOE:
+    if model_arch not in _MODEL_REGISTRY:
         raise ValueError(
             f"No HF-safetensors converter for architecture: "
-            f"{ModelArchNames.get(model_arch, model_arch) if model_arch is not None else override_model_arch}. "
-            "HF-direct conversion is only supported for qwen35moe."
+            f"{ModelArchNames.get(model_arch, model_arch)}. "
+            f"Available: {[names[0] for names in ModelArchNames.values() if names]}."
         )
-    converter_class = _MODEL_REGISTRY[ModelArch.QWEN35MOE]
+    converter_class = _MODEL_REGISTRY[model_arch]
     return converter_class(hf_source, config_json_path=config_json_path)
+
+
+def _sniff_hf_arch(hf_source: str) -> ModelArch:
+    """Best-effort arch detection from an HF repo's config.json."""
+    import json as _json
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        hf_hub_download = None
+
+    cfg_path: str | None = None
+    if os.path.isdir(hf_source):
+        candidate = os.path.join(hf_source, "config.json")
+        if os.path.isfile(candidate):
+            cfg_path = candidate
+    elif hf_hub_download is not None:
+        try:
+            cfg_path = hf_hub_download(hf_source, "config.json")
+        except Exception:
+            cfg_path = None
+
+    if cfg_path is not None:
+        try:
+            with open(cfg_path) as f:
+                cfg = _json.load(f)
+            model_type = str(cfg.get("model_type", "")).lower()
+            for arch_enum, arch_names in ModelArchNames.items():
+                if model_type in arch_names:
+                    return arch_enum
+        except Exception:
+            pass
+    return ModelArch.QWEN35MOE

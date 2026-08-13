@@ -207,6 +207,17 @@ FAMILY_PROFILES: Tuple[FamilyProfile, ...] = (
         notes="Tensor names are identical to Llama's, so it can only be told "
         "apart by general.architecture / basename / field prefix.",
     ),
+    FamilyProfile(
+        arch=ModelArch.QWEN3_OMNI_MOE,
+        family="qwen3.6-moe",
+        keywords=("qwen3-omni", "qwen3omni", "omni-moe", "omni_moe"),
+        fingerprints=("ffn_gate_exps", "ffn_gate_inp_shexp", "ssm_conv1d"),
+        required_any=("ffn_gate_exps", "ffn_gate_inp_shexp"),
+        excludes=("attn_sinks",),
+        notes="Qwen3-Omni MoE thinker: the Qwen3.5-MoE hybrid text stack "
+        "(ffn_gate_inp_shexp / ffn_gate_exps / ssm_*), told apart from plain "
+        "qwen3.6-moe by the 'omni' basename keyword.",
+    ),
 )
 
 # reverse map: embedding dim -> dense Qwen3.5 variant

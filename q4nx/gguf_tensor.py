@@ -223,11 +223,13 @@ class GGUFTensor:
             GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q8_0
         )
         # The Q4_0/Q4_1/Q8_0 block-quantized formats only make sense for 2D
-        # matmul weight matrices; 1D tensors (e.g. rope_freqs, biases) are
-        # never packed this way even when a config entry is missing and
-        # falls back to the global default_tensor_type. Treat those as
-        # native float passthrough regardless of the requested target.
-        if len(self.shape) < 2:
+        # matmul weight matrices; 1D tensors (e.g. rope_freqs, biases) and
+        # any "*.bias" tensor (including 2D MoE expert biases such as
+        # gpt-oss ffn_*_exps.bias of shape (num_experts, hidden)) are never
+        # packed this way even when a config entry is missing and falls back
+        # to the global default_tensor_type. Treat those as native float
+        # passthrough regardless of the requested target.
+        if len(self.shape) < 2 or (is_native_float and self.name.endswith(".bias")):
             wants_quantized_target = False
 
         if is_native_float and not wants_quantized_target:

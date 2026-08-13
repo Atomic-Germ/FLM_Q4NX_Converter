@@ -1,7 +1,12 @@
 import os
+import json
+from pathlib import Path
+import numpy as np
 from ..model_converter import __Q4NX_Converter
 from ..constants import ModelArch
+from ..gguf_tensor import GGUFTensor
 from gguf import GGUFReader, dequantize, quantize, GGMLQuantizationType
+from safetensors import safe_open
 from safetensors.torch import save_file
 import torch
 from gguf import dequantize
@@ -9,6 +14,13 @@ from einops import rearrange
 import torch.nn.functional as F
 from safetensors.torch import save_file, load_file
 class GPTOSS(__Q4NX_Converter, model_arch=ModelArch.GPT_OSS):
+    # Optional HF repo id / local file / local dir to pull the original
+    # (high-precision) embed_tokens.weight from, instead of using the lossy
+    # dequantized embed of a re-quantized GGUF. Distinct from the asset
+    # source (-s FastFlowLM/...); set externally by convert.py before
+    # convert() via the dedicated --embed-source flag.
+    embed_source: str | None = None
+
     def __init__(self, gguf_reader: GGUFReader):
         self.gguf_reader = gguf_reader
         self.gguf_tensors = []
@@ -226,6 +238,126 @@ class GPTOSS(__Q4NX_Converter, model_arch=ModelArch.GPT_OSS):
         result_tensors_map[new_name + "_prefill"] = original_weight.to(torch.bfloat16)
         
  
+    def _requant_expert_to_mxfp4(self, gguf_tensor: GGUFTensor):
+        # gpt-oss MoE expert weights (ffn_{up,gate,down}_exps.weight) must be
+        # MXFP4-packed for the Q4NX runtime: post_gpt_oss_process injects each
+        # per-expert bias into the 3-byte gap MXFP4 leaves per 32 values (1B
+        # scale) vs Q4_1's full 4B (2B scale + 2B min). Re-quantized GGUFs
+        # (mradermacher i1-Q4_1, Q4_K_M, BF16, ...) store experts in the
+        # GGUF's house quant, so dequantize + re-quantize to MXFP4 here, then
+        # split into the (scales, data) pair _pack_MXFP4_q4nx expects.
+        w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
+        w = np.ascontiguousarray(w, dtype=np.float32)
+        w_mx = quantize(w, GGMLQuantizationType.MXFP4)
+        scales_np, data_np = GGUFTensor.split_ggml_mxfpx_to_scale_blocks(w_mx)
+        return torch.from_numpy(scales_np), torch.from_numpy(data_np)
+
+    def _load_embed_from_safetensors(self, shard_path: Path) -> torch.Tensor | None:
+        """Read model.embed_tokens.weight from one safetensors shard."""
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            if "model.embed_tokens.weight" in f.keys():
+                return f.get_tensor("model.embed_tokens.weight")
+        return None
+
+    def _resolve_embed_from_source(self, embed_source: str | None) -> torch.Tensor | None:
+        """Locate the original (high-precision) embed_tokens.weight.
+
+        ``embed_source`` is the dedicated --embed-source argument -- distinct
+        from --source-model (the asset repo). Resolution order:
+          1. embed_source is a local safetensors file  -> read its embed tensor.
+          2. embed_source is a local directory -> use model.safetensors
+             or model.safetensors.index.json to find the right shard.
+          3. embed_source looks like an HF repo id ('org/name') -> download
+             model.safetensors.index.json (small), find the shard that holds
+             the embed, then download ONLY that shard (not the whole model).
+          4. Legacy fallback: model-00001-of-00001.safetensors in the CWD.
+        Returns the BF16 embed tensor, or None if no source has it.
+        """
+        keys = ("model.embed_tokens.weight",)
+
+        def try_dir(d: Path) -> torch.Tensor | None:
+            idx = d / "model.safetensors.index.json"
+            if idx.is_file():
+                try:
+                    weight_map = json.loads(idx.read_text()).get("weight_map", {})
+                except Exception as e:
+                    print(f"[WARN] Could not parse {idx}: {e}")
+                    weight_map = {}
+                shard_name = weight_map.get("model.embed_tokens.weight")
+                if shard_name:
+                    p = d / shard_name
+                    if p.is_file():
+                        return self._load_embed_from_safetensors(p)
+            # single-shard
+            single = d / "model.safetensors"
+            if single.is_file():
+                return self._load_embed_from_safetensors(single)
+            # last resort: scan shards in the dir
+            for p in sorted(d.glob("*.safetensors")):
+                t = self._load_embed_from_safetensors(p)
+                if t is not None:
+                    return t
+            return None
+
+        def try_repo(repo_id: str) -> torch.Tensor | None:
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError:
+                print("[WARN] huggingface_hub not installed; cannot fetch BF16 embed from HF")
+                return None
+            # Cheap first step: the index (KB-scale) tells us which shard
+            # has the embed so we only download that one shard, not the full
+            # multi-GB BF16 model.
+            try:
+                idx_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors.index.json")
+            except Exception:
+                idx_path = None
+            if idx_path is not None:
+                try:
+                    weight_map = json.loads(Path(idx_path).read_text()).get("weight_map", {})
+                except Exception as e:
+                    print(f"[WARN] Could not parse index.json from {repo_id}: {e}")
+                    weight_map = {}
+                shard_name = weight_map.get("model.embed_tokens.weight")
+                if shard_name:
+                    print(f"[INFO] Fetching embed shard '{shard_name}' from {repo_id}")
+                    try:
+                        sp = hf_hub_download(repo_id=repo_id, filename=shard_name)
+                        return self._load_embed_from_safetensors(Path(sp))
+                    except Exception as e:
+                        print(f"[WARN] Could not download {shard_name} from {repo_id}: {e}")
+            # single-shard repo
+            print(f"[INFO] Fetching embed shard 'model.safetensors' from {repo_id}")
+            try:
+                sp = hf_hub_download(repo_id=repo_id, filename="model.safetensors")
+                return self._load_embed_from_safetensors(Path(sp))
+            except Exception as e:
+                print(f"[WARN] {repo_id} has no usable safetensors embed: {e}")
+                return None
+
+        # 1-2: local file/dir
+        if embed_source:
+            p = Path(embed_source)
+            if p.is_file() and p.suffix == ".safetensors":
+                t = self._load_embed_from_safetensors(p)
+                if t is not None:
+                    return t
+            if p.is_dir():
+                t = try_dir(p)
+                if t is not None:
+                    return t
+            # 3: HF repo id (not a local path, single-slash 'org/name')
+            if not os.path.exists(embed_source) and "/" in embed_source \
+                    and not embed_source.startswith(("http://", "https://", "file:")) \
+                    and len(embed_source.split("/")) == 2:
+                return try_repo(embed_source)
+
+        # 4: legacy CWD fallback (preserves the dev workflow)
+        legacy = Path("model-00001-of-00001.safetensors")
+        if legacy.is_file():
+            return self._load_embed_from_safetensors(legacy)
+        return None
+
     def convert(self, q4nx_path: str, weights_type: str = 'language'):
         self.q4nx_tensors = {}
 
@@ -246,6 +378,23 @@ class GPTOSS(__Q4NX_Converter, model_arch=ModelArch.GPT_OSS):
                 self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w.contiguous()
                 continue
 
+            # MoE expert weights (ffn_{up,gate,down}_exps.weight) MUST be
+            # MXFP4-packed: post_gpt_oss_process injects each per-expert bias
+            # into the 3-byte MXFP4 scale gap (1B scale / 32 values) that Q4_1
+            # (2B scale + 2B min) fills entirely. Source GGUFs that re-quantize
+            # experts (mradermacher i1-Q4_1, Q4_K_M, BF16, ...) arrive here in
+            # the GGUF's house quant, so dequantize + re-quantize to MXFP4 and
+            # pack via _pack_MXFP4_q4nx -- the 4-D (num_experts, ...) layout the
+            # runtime + post_gpt_oss_process expect. Native-MXFP4 sources take
+            # the same pack path directly from unpacked (scales, data).
+            if gguf_tensor.name.endswith("_exps.weight"):
+                if gguf_tensor.tensor_type == GGMLQuantizationType.MXFP4:
+                    scales, data = gguf_tensor.unpack(self.default_tensor_type)
+                else:
+                    scales, data = self._requant_expert_to_mxfp4(gguf_tensor)
+                self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = self._pack_MXFP4_q4nx(scales, data)
+                continue
+
             unpacked = gguf_tensor.unpack(self.default_tensor_type)
             #     continue
             if self.forward_name_map[gguf_tensor.name] == "lm_head.weight":
@@ -261,15 +410,21 @@ class GPTOSS(__Q4NX_Converter, model_arch=ModelArch.GPT_OSS):
             elif gguf_tensor.tensor_type == GGMLQuantizationType.MXFP4:
                 self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = self._pack_MXFP4_q4nx(*unpacked)
             elif gguf_tensor.tensor_type == GGMLQuantizationType.F32:
+                # Request F32 (not the Q4_1 default) so unpack() returns a
+                # single float tensor for 2D F32 tensors too: gpt-oss MoE
+                # expert biases (ffn_*_exps.bias, shape (num_experts, hidden))
+                # and the router weight (ffn_gate_inp.weight) are both 2D F32.
+                # With the global Q4_1 default, unpack() would instead
+                # dequantize+requantize them and return a (d,m,q) 3-tuple,
+                # tripping the len==1 asserts below.
+                f32_unpacked = gguf_tensor.unpack(GGMLQuantizationType.F32)
+                assert len(f32_unpacked) == 1
+                f = f32_unpacked[0]
                 if gguf_tensor.name.endswith("ffn_gate_inp.weight"):
-                    assert len(unpacked) ==1
                     new_name = self.forward_name_map[gguf_tensor.name]
-                    self.process_gptoss_router_weights(weight=unpacked[0], new_name=new_name, result_tensors_map=self.q4nx_tensors)
-                elif gguf_tensor.name.endswith(".bias") or gguf_tensor.name.endswith(".weight") :
-                    assert len(unpacked) ==1
-                    self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = unpacked[0].to(torch.bfloat16)  # convert fp32 to bf16
-
-                    
+                    self.process_gptoss_router_weights(weight=f, new_name=new_name, result_tensors_map=self.q4nx_tensors)
+                elif gguf_tensor.name.endswith(".bias") or gguf_tensor.name.endswith(".weight"):
+                    self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = f.to(torch.bfloat16)  # convert fp32 to bf16
                 else:
                     raise ValueError(f"Unsupported F32 tensor {gguf_tensor.name} in GPTOSS model")
             else:
@@ -278,15 +433,28 @@ class GPTOSS(__Q4NX_Converter, model_arch=ModelArch.GPT_OSS):
 
 
         self.post_gpt_oss_process(self.q4nx_tensors, self.num_layers)
-        
-        
-        
-        #FIXME: token_embed.weight dequant to bf16? But use python for now???
-        safetensors_with_embed_tokens_weights = "model-00001-of-00001.safetensors"
-        if os.path.exists(safetensors_with_embed_tokens_weights):
-            self.q4nx_tensors["model.embed_tokens.weight"] = load_file(safetensors_with_embed_tokens_weights)["model.embed_tokens.weight"]
+
+        # Override embed_tokens.weight with the original high-precision embed
+        # from the source model when available. Re-quantized GGUFs
+        # (mradermacher i1-Q4_1, etc.) store token_embd.weight in the GGUF's
+        # house quant (Q4_1), so dequantizing it here yields a lossy bf16 embed.
+        # The original BF16 embed lives in the upstream source; pull it from
+        # -s <source> (local dir, safetensors file, or HF repo id) via
+        # _resolve_embed_from_source.
+        embed = self._resolve_embed_from_source(self.embed_source)
+        if embed is not None:
+            embed = embed.to(torch.bfloat16).contiguous()
+            print(f"[INFO] Replaced model.embed_tokens.weight with original embed "
+                  f"from source (shape={tuple(embed.shape)}, dtype={embed.dtype})")
+            self.q4nx_tensors["model.embed_tokens.weight"] = embed
         else:
-            print(f"[WARNING] {safetensors_with_embed_tokens_weights} not found. Skipping embed_tokens.weight replacement.")
+            gguf_type = self.gguf_tensors.get("token_embd.weight")
+            gguf_type_name = gguf_type.tensor_type.name if gguf_type is not None else "?"
+            print(
+                f"[WARNING] No BF16 embed source available: model.embed_tokens.weight "
+                f"is left as the lossy {gguf_type_name}-dequantized tensor from the GGUF. "
+                f"Pass -e <original-bf16-repo> (e.g. openai/gpt-oss-20b) to override."
+            )
 
 
 

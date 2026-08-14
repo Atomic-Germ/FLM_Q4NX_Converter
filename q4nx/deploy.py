@@ -28,25 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .constants import ModelArch
-
-ARCH_TO_FAMILY: Dict[ModelArch, str] = {
-    ModelArch.QWEN35_08B: "qwen3.5",
-    ModelArch.QWEN35_2B: "qwen3.5",
-    ModelArch.QWEN35_4B: "qwen3.5",
-    ModelArch.QWEN35_9B: "qwen3.5",
-    ModelArch.QWEN35MOE: "qwen3.6-moe",
-    ModelArch.QWEN3: "qwen3",
-    ModelArch.QWEN3VL: "qwen3vl",
-    ModelArch.QWEN2: "qwen2.5",
-    ModelArch.QWEN2VL: "qwen2.5vl",
-    ModelArch.GEMMA3: "gemma3",
-    ModelArch.GEMMA4: "gemma4",
-    ModelArch.LLAMA: "llama3.2",
-    ModelArch.LFM2: "lfm2",
-    ModelArch.PHI4: "phi4",
-    ModelArch.GPT_OSS: "gpt-oss",
-    ModelArch.NANBEIGE: "nanbeige",
-}
+from .arch_detect import ARCH_TO_FAMILY
 
 ARCH_TO_SIZE: Dict[ModelArch, str] = {
     ModelArch.QWEN35_08B: "0.8b",

@@ -5,7 +5,7 @@ from gguf import GGUFReader
 from .constants import ModelArch, ModelArchNames
 from .constants import ModelArchConfigs
 from .constants import QWEN35_VARIANT_DIMS
-from .arch_detect import detect_model_family
+from .arch_detect import detect_model_family, resolve_override_arch
 from .gguf_tensor import GGUFTensor, GGMLQuantizationType
 from typing import List, Dict, Type
 import os
@@ -1039,18 +1039,7 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
     """
     
     if override_model_arch != "":
-        # flm model names use a colon (e.g. 'qwen3.5:9b') while arch names use
-        # a dash (e.g. 'qwen3.5-9B'). Normalize before matching, and prefer the
-        # longest matching arch name so 'qwen3.5:9b' selects the Qwen3.5 9B
-        # converter instead of the prefix-matched plain Qwen3 converter.
-        normalized_override = override_model_arch.replace(":", "-").lower()
-        best_match: ModelArch | None = None
-        best_len = 0
-        for arch_enum, arch_names in ModelArchNames.items():
-            for arch_name in arch_names:
-                if normalized_override.startswith(arch_name.lower()) and len(arch_name) > best_len:
-                    best_match = arch_enum
-                    best_len = len(arch_name)
+        best_match = resolve_override_arch(override_model_arch)
         if best_match is not None:
             return best_match
         print("Warning: Did not find matching override model arch, attempting to load base on gguf information")
@@ -1171,17 +1160,7 @@ def create_hf_converter(
     Only the Qwen3.5 MoE converter supports an HF source for now.
     """
     if override_model_arch:
-        normalized_override = override_model_arch.replace(":", "-").lower()
-        for arch_enum, arch_names in ModelArchNames.items():
-            for arch_name in arch_names:
-                if normalized_override.startswith(arch_name.lower()):
-                    model_arch = arch_enum
-                    break
-            else:
-                continue
-            break
-        else:
-            model_arch = None
+        model_arch = resolve_override_arch(override_model_arch)
     else:
         model_arch = ModelArch.QWEN35MOE
 

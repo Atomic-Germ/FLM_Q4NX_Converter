@@ -260,6 +260,18 @@ class GGUFTensor:
                 already handles F32/F16/BF16 as a passthrough/cast) and then
                 quantize it to default_tensor_type before packing.
             """
+            # Block-quantized targets (Q4_0/Q4_1/Q8_0) require the last
+            # dimension to be a multiple of 32. Tensors that don't fit -- e.g.
+            # small F32 auxiliary tensors with a 3-wide axis, common in LFM2
+            # (shortconv / ssm-style weights) -- cannot be packed that way, so
+            # keep them as a float passthrough rather than crashing in
+            # gguf.quantize.
+            if wants_quantized_target and self.shape and self.shape[-1] % 32 != 0:
+                w = dequantize(self.data, self.tensor_type)
+                w = torch.from_numpy(w).contiguous()
+                if self.tensor_type == GGMLQuantizationType.BF16:
+                    w = w.view(torch.bfloat16)
+                return [w]
             return self._requantize_to(default_tensor_type)
 
     def _requantize_to(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
@@ -287,5 +299,16 @@ class GGUFTensor:
                 raise ValueError(f"Unsupported tensor type: {default_tensor_type.name}")
             return d, m, qw
         except Exception as e:
-            print(f"Error unpacking {self.tensor_type.name}: {e}")
-            return None, None, None
+            print(
+                f"[WARN] Could not quantize {self.tensor_type.name} tensor "
+                f"(shape {list(self.shape)}) to {default_tensor_type.name}: {e}; "
+                "keeping it as a float passthrough instead of crashing."
+            )
+            try:
+                w = dequantize(self.data, self.tensor_type)
+                w = torch.from_numpy(np.array(w)).contiguous()
+                if self.tensor_type == GGMLQuantizationType.BF16:
+                    w = w.view(torch.bfloat16)
+                return [w]
+            except Exception:
+                return None, None, None

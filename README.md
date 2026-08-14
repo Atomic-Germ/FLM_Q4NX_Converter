@@ -510,12 +510,42 @@ flm serve qwen3vl-it:4b-custom
 
 
 
+## Installing `flm-add`
+
+`flm-add` is a separate, dependency-free (Python stdlib only) tool that
+installs a pre-converted FLM model and registers it with FastFlowLM. It can be
+run from a checkout or installed globally with `uv`:
+
+```bash
+# from this repository
+uv tool install .
+
+# or directly from git / PyPI once published
+uv tool install git+https://github.com/atomic-germ/Q4NX_Converter
+uv tool install flm-add
+```
+
+This installs a single `flm-add` executable that works with any repo containing
+runtime-ready files (config.json, model.q4nx, tokenizer files), so it no longer
+needs to be packed with every model and updated per release:
+
+```bash
+flm-add Atomic-Germ/Qwen3.5-9B-Claude-4.8-Opus-NPU2
+flm-add GPT-OSS-GPT5.2-Distill-NPU2 --tag gpt-oss-distill:20b   # local dir
+flm-add --help
+```
+
+The legacy standalone script at the repo root (`flm-add.py`) remains as a shim
+for running from a checkout; previously shipped self-contained copies keep
+working unchanged.
+
 ## Project Structure
 - `convert.py`: The main CLI script for running conversions.
 - `setup_venv.sh`: Initializes the Python virtual environment and installs dependencies.
 - `activate.sh`: Activates the virtual environment and sets up environment variables.
 - `q4nx/`: Core package containing the conversion logic, gguf tensor parsing, and model-specific implementations.
 - `configs/`: JSON configuration files for supported model architectures.
+- `flm_add/`: Installable `flm-add` tool package (see `pyproject.toml`).
 
 
 ## Known Issues

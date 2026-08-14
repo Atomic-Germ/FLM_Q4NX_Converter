@@ -268,7 +268,7 @@ class GGUFTensor:
         """Dequantize the source tensor and re-quantize it into the requested
         target format, returning a (d, m, qw) tuple ready for packing."""
         try:
-            w = dequantize(self.data, self.tensor_type)
+            w = dequantize(self.data, self.tensor_type).copy()
             w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
 
             if default_tensor_type == GGMLQuantizationType.BF16:

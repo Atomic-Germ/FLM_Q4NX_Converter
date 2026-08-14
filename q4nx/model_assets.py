@@ -7,6 +7,9 @@ from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .arch_detect import ARCH_TO_FAMILY, family_from_text, resolve_override_arch
+from .constants import ModelArch
+
 ASSET_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
 REQUIRED_ASSETS = ["config.json", "tokenizer.json", "tokenizer_config.json"]
 
@@ -182,11 +185,52 @@ def _hf_download_file(repo_id: str, filename: str) -> Optional[str]:
 
 
 # Quantized GGUF preference order when -i names an HF repo instead of a file.
+# Most families convert best starting from q4_1; a few (e.g. LFM) prefer q4_0,
+# and some (e.g. gpt-oss) additionally accept mxfp4 as a last resort. The
+# per-family overrides below are keyed by runtime family name; anything not
+# listed falls back to GGUF_QUANT_PRIORITY. The order is resolved per call from
+# the -f flag (exact) or, as a best-effort fallback, the repo id / GGUF
+# filenames (so the user only needs -f when auto-detection guesses wrong).
 GGUF_QUANT_PRIORITY: Tuple[str, ...] = ("q4_1", "q4_0", "q8_0")
 
+GGUF_QUANT_PRIORITY_BY_FAMILY: Dict[str, Tuple[str, ...]] = {
+    "lfm2": ("q4_0", "q4_1", "q8_0"),
+    "gpt-oss": ("q4_1", "q4_0", "q8_0", "mxfp4"),
+}
 
-def find_repo_gguf(repo_id: str) -> Optional[Tuple[str, str]]:
-    """Search an HF repo for a quantized GGUF: q4_1, then q4_0, then q8_0.
+
+def _gguf_quant_priority(override_model_arch: str, repo_id: str, gguf_filenames: List[str]) -> Tuple[str, ...]:
+    """Resolve the GGUF quant fallback order for an HF repo.
+
+    Precedence:
+      1. -f flag (resolve override_model_arch -> family)
+      2. best-effort keyword match against the repo id or any .gguf filename
+      3. the global GGUF_QUANT_PRIORITY default
+    """
+    family: Optional[str] = None
+    if override_model_arch:
+        arch = resolve_override_arch(override_model_arch)
+        if arch is not None:
+            family = ARCH_TO_FAMILY.get(arch)
+    if family is None:
+        family = family_from_text(repo_id)
+    if family is None:
+        for fname in gguf_filenames:
+            family = family_from_text(os.path.basename(fname))
+            if family is not None:
+                break
+    if family and family in GGUF_QUANT_PRIORITY_BY_FAMILY:
+        return GGUF_QUANT_PRIORITY_BY_FAMILY[family]
+    return GGUF_QUANT_PRIORITY
+
+
+def find_repo_gguf(repo_id: str, override_model_arch: str = "") -> Optional[Tuple[str, str]]:
+    """Search an HF repo for a quantized GGUF, in family-preferred order.
+
+    The quant fallback order is family-aware: most families prefer q4_1 then
+    q4_0 then q8_0, but some differ (e.g. LFM prefers q4_0 first; gpt-oss also
+    accepts mxfp4 last). It is driven by the -f flag when given, otherwise by a
+    best-effort match on the repo id / GGUF filenames.
 
     Returns (local_path, repo_filename) using the HF cache (downloading if
     needed), or None if the repo has no matching GGUF.
@@ -202,23 +246,26 @@ def find_repo_gguf(repo_id: str) -> Optional[Tuple[str, str]]:
         print(f"[WARN] Could not list files in {repo_id}: {e}")
         return None
 
+    gguf_filenames = [
+        f for f in files if f.lower().endswith(".gguf")
+    ]
+    priority = _gguf_quant_priority(override_model_arch, repo_id, gguf_filenames)
+
     matches = []  # (priority_index, filename)
     other_ggufs = []
-    for fname in files:
-        if not fname.lower().endswith(".gguf"):
-            continue
+    for fname in gguf_filenames:
         low = os.path.basename(fname).lower()
         found = next(
-            (q for q in GGUF_QUANT_PRIORITY if q in low), None
+            (q for q in priority if q in low), None
         )
         if found is not None:
-            matches.append((GGUF_QUANT_PRIORITY.index(found), fname))
+            matches.append((priority.index(found), fname))
         else:
             other_ggufs.append(fname)
     if not matches:
         if other_ggufs:
             print(
-                f"[WARN] No {', '.join(GGUF_QUANT_PRIORITY)} GGUF in {repo_id}; "
+                f"[WARN] No {', '.join(priority)} GGUF in {repo_id}; "
                 f"only found: {', '.join(sorted(other_ggufs))}"
             )
         return None

@@ -45,14 +45,17 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
     # is never treated as a weight source, so it can't trigger a weights
     # download when converting from GGUF.
     #
-    # New: -i <hf-repo-id> prefers a quantized GGUF shipped in the repo itself
-    # (q4_1, then q4_0, then q8_0), downloading it via the HF cache. If the
-    # repo has none, we fall back to the HF-safetensors source path below.
+    # New: -i <hf-repo-id> prefers a quantized GGUF shipped in the repo itself,
+    # chosen in a family-preferred order (default q4_1, then q4_0, then q8_0;
+    # e.g. LFM prefers q4_0 first, gpt-oss also accepts mxfp4 last). The order
+    # is driven by -f when given, otherwise by a best-effort repo-id/filename
+    # match. The chosen GGUF is downloaded via the HF cache; if the repo has
+    # none, we fall back to the HF-safetensors source path below.
     hf_input = None
     source_file = None
     if is_hf_repo_id(gguf_path):
         repo_id = gguf_path
-        found = find_repo_gguf(repo_id)
+        found = find_repo_gguf(repo_id, override_model_arch)
         if found is not None:
             gguf_path, source_file = found
             source_model = source_model or repo_id
@@ -98,13 +101,15 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
 def main():
     parser = argparse.ArgumentParser(
         description='Convert GGUF or HF-safetensors model files to Q4NX format (output always named model.q4nx). '
-                    '-i also accepts an HF repo id: the repo is searched for a q4_1 / q4_0 / q8_0 GGUF (in that order) '
-                    'and that file is downloaded and converted.',
+                    '-i also accepts an HF repo id: the repo is searched for a quantized GGUF, chosen in a '
+                    'family-preferred order (default q4_1 / q4_0 / q8_0; e.g. LFM prefers q4_0 first). Pass -f to '
+                    'force the family and override the auto-detected source GGUF.',
         epilog='Examples:\n'
                '  python convert.py -i model.gguf\n'
                '  python convert.py -i model.gguf -o output_folder\n'
                '  python convert.py model.gguf output_folder\n'
                '  python convert.py -i Qwen/Qwen3.5-9B -o output_folder     (HF repo: picks a q4_1/q4_0/q8_0 GGUF from it)\n'
+               '  python convert.py -i LiquidAI/LFM2-1.2B -o out -f lfm2      (force LFM family -> prefers q4_0 source)\n'
                '  python convert.py -i /path/to/hf_model_dir -o output_folder   (HF safetensors source, e.g. Darwin-36B-Opus)\n'
                '  python convert.py -i vision_model.gguf -o output_folder -t vision',
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -113,7 +118,7 @@ def main():
     # Add support for both flag-based and positional arguments
     parser.add_argument('input_file', nargs='?', help='Input GGUF file (positional)')
     parser.add_argument('output_folder', nargs='?', help='Output folder (positional, optional)')
-    parser.add_argument('-i', '--input', dest='input_flag', help='Input GGUF file, or an HF repo id (a q4_1/q4_0/q8_0 GGUF is auto-selected from the repo)')
+    parser.add_argument('-i', '--input', dest='input_flag', help='Input GGUF file, or an HF repo id (a quantized GGUF is auto-selected in family-preferred order; use -f to force the family)')
     parser.add_argument('-o', '--output', dest='output_flag', help='Output folder (optional, defaults to input file directory)')
     parser.add_argument('-t', '--type', dest='weights_type', default='language', help='Type of weights to convert (default: language)',
                         choices=['language', 'vision', 'audio'])
@@ -158,4 +163,4 @@ def main():
 if __name__ == "__main__":
     # for debug, give the path and ouptut path here by directly set the command line args
     import sys
-main()
+    main()

@@ -433,6 +433,70 @@ def detect_model_family(reader: GGUFReader) -> List[Guess]:
     return ranked
 
 
+def resolve_override_arch(override: str) -> Optional[ModelArch]:
+    """Map a user-supplied -f arch string to a ModelArch, or None.
+
+    Mirrors the override branch of get_model_arch_from_gguf: flm tag names use
+    a colon (e.g. 'qwen3.5:9b') while arch names use a dash (e.g. 'qwen3.5-9B').
+    Normalize and prefer the longest matching arch name so a shorthand still
+    resolves to the right converter.
+    """
+    if not override:
+        return None
+    normalized = override.replace(":", "-").lower()
+    best_match: Optional[ModelArch] = None
+    best_len = 0
+    for arch_enum, arch_names in ModelArchNames.items():
+        for arch_name in arch_names:
+            if normalized.startswith(arch_name.lower()) and len(arch_name) > best_len:
+                best_match = arch_enum
+                best_len = len(arch_name)
+    return best_match
+
+
+def family_from_text(text: str) -> Optional[str]:
+    """Best-effort family name from an arbitrary string (repo id, file name).
+
+    Longest keyword across FAMILY_PROFILES wins. Returns None if nothing
+    matches, so callers can fall back to the default quant priority. Used to
+    pick a sensible GGUF quant order for an HF repo before any GGUF is
+    downloaded (the user can always override with -f).
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    best_family: Optional[str] = None
+    best_keyword = ""
+    for profile in FAMILY_PROFILES:
+        for keyword in profile.keywords:
+            if keyword.lower() in lowered and len(keyword) > len(best_keyword):
+                best_family = profile.family
+                best_keyword = keyword
+    return best_family
+
+
+# ModelArch -> runtime family name. Also used to pick a per-family GGUF quant
+# fallback order in model_assets.find_repo_gguf.
+ARCH_TO_FAMILY: Dict[ModelArch, str] = {
+    ModelArch.QWEN35_08B: "qwen3.5",
+    ModelArch.QWEN35_2B: "qwen3.5",
+    ModelArch.QWEN35_4B: "qwen3.5",
+    ModelArch.QWEN35_9B: "qwen3.5",
+    ModelArch.QWEN35MOE: "qwen3.6-moe",
+    ModelArch.QWEN3: "qwen3",
+    ModelArch.QWEN3VL: "qwen3vl",
+    ModelArch.QWEN2: "qwen2.5",
+    ModelArch.QWEN2VL: "qwen2.5vl",
+    ModelArch.GEMMA3: "gemma3",
+    ModelArch.GEMMA4: "gemma4",
+    ModelArch.LLAMA: "llama3.2",
+    ModelArch.LFM2: "lfm2",
+    ModelArch.PHI4: "phi4",
+    ModelArch.GPT_OSS: "gpt-oss",
+    ModelArch.NANBEIGE: "nanbeige",
+}
+
+
 def render_chart() -> str:
     """Render the family -> detection-heuristic chart as markdown."""
     lines = [

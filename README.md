@@ -1,6 +1,6 @@
 # FLM Q4NX Converter
 
-A utility for converting GGUF model files into the Q4NX format. This tool supports converting language, vision, and audio model weights.
+A utility for converting GGUF model files, usually fine-tunes, into the Q4NX format. This tool supports converting language, vision, and audio model weights.
 
 ## Supported Models
 Based on the configuration, the converter supports several model architectures, including:
@@ -14,15 +14,17 @@ Based on the configuration, the converter supports several model architectures, 
 - Qwen 3
 - Qwen 3 VL
 - Qwen 3.5
+- Qwen 3.5 MoE
+- Qwen 3.6 MoE
 
 ### Weight Type Support
 - `language`: supported for model families in `configs/`
 - `vision`: supported for vision-capable architectures (for example, Gemma 4 and Qwen3-VL)
-- `audio`: currently supported for **Gemma 4** (`-t audio`)
+- `audio`: currently supported for **Gemma 4** variants (`-t audio`)
 
 ## Setup
 
-The project includes a setup script that automatically creates a Python virtual environment, installs required dependencies (like `torch`, `amd-quark`, `transformers`), and sets up the `gguf` package from `llama.cpp`.
+Create a virtual environment using python 3.13
 
 1. Create and activate a virtual environment using pip or uv:
    ```bash

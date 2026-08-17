@@ -1,4 +1,4 @@
-#!./.venv/bin/python3
+#!/usr/bin/env python3
 """
 axlf.py — AMD/Xilinx AXLF (xclbin2) container parser
 

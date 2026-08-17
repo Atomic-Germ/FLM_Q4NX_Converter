@@ -43,4 +43,3 @@ for model_dir in xclbin_dir.iterdir():
         print(f"File: {ext_file.relative_to(Path.cwd())}")
 
 print("\n\nAnalysis complete! Review individual xclbins for detailed CDO/DMA info.")
-SCRIPTEND && python3 /home/atomic-germ/Code/OpenNPU/analyze_xclbins.py 2>&1 | head -50

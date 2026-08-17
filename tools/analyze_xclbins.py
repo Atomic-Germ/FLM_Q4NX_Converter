@@ -30,7 +30,7 @@ def analyze_single_xclbin(path):
     return result
 
 # Main analysis loop  
-xclbin_dir = Path("/home/atomic-germ/Code/OpenNPU/FastFlowLM/src/xclbins")
+xclbin_dir = Path("../FastFlowLM/src/xclbins")
 results = []
 
 print("Scanning xclbins...")

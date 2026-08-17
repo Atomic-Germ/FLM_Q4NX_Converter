@@ -9,7 +9,7 @@ except Exception as e:     result["error"] = str(e)
 return result
 
 # Main analysis loop  
-xclbin_dir = Path("../FastFlowLM/src/xclbins")
+xclbin_dir = str(Path(__file__).parent / "FastFlowLM/src/xclbins")
 results = []
 
 print("Scanning xclbins...")

@@ -401,7 +401,7 @@ class CdoParser:
             lines.append("    (none found)")
         lines += ["", "  Program memory loads (0x10000-0x1CFFF, static VLIW code):"]
         for (col, row), nb in sorted(pm_bytes.items()):
-            lines.append(f"    tile({col},{row})  {nb} bytes  ({nb//16} VLIW instrs @ 16B each)")
+            lines.append(f"    tile({col},{row})  {nb} bytes  ({nb//24} VLIW instrs @ 24B each)")
         if not pm_bytes:
             lines.append("    (none — VLIW programs loaded at runtime via DPU instr buffer)")
 

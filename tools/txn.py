@@ -18,6 +18,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Optional
 
 
 # ── Opcodes ──────────────────────────────────────────────────────────────────
@@ -304,10 +305,6 @@ class TxnParser:
 
     def _parse_maskwrite(self, byte_off: int):
         # 7 words: [op][unused][addr][unused][value][mask][op_size]
-        if self.pos + 7 > len(self.words):
-            w = self._read(len(self.words) - self.pos)
-            self.instrs.append(Instr(byte_off, Op.MASKWRITE, w))
-            return
         w = self._read(7)
         col, row, reg = decode_addr(w[2])
         value = w[4]
@@ -323,10 +320,6 @@ class TxnParser:
 
     def _parse_ddr_patch(self, byte_off: int):
         # 12 words: [op][size<<2][0][0][0][0][bd_reg][0][arg_idx][0][arg_off][0]
-        if self.pos + 12 > len(self.words):
-            w = self._read(len(self.words) - self.pos)
-            self.instrs.append(Instr(byte_off, Op.DDR_PATCH, w))
-            return
         w = self._read(12)
         bd_reg = w[6]
         col = (bd_reg >> BD_COL_SHIFT) & BD_COL_MASK

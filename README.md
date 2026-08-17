@@ -26,10 +26,14 @@ Based on the configuration, the converter supports several model architectures, 
 
 Create a virtual environment using python 3.13
 
+1. Create and activate a virtual environment using pip or uv:
    ```bash
-   uv venv venv --python 3.13
-   source venv/bin/activate
-   UV_TORCH_BACKEND="rocm7.2" uv pip install -r requirements.txt
+   uv venv venv
+   venv/bin/activate
+   ```
+2. Install dependencies (one time)
+   ```bash
+   uv pip install -r requirements.txt
    ```
 
 ## Usage

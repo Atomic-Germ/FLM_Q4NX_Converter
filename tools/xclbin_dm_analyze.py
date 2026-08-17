@@ -20,7 +20,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from axlf import load
-from cdo  import parse_xclbin_cdo, CdoDmaWriteCmd
+from cdo  import parse_xclbin_cdo, CdoDmaWriteCmd, CdoWriteCmd, CdoMaskWriteCmd
 
 CORE_DM_BASE = 0x20000
 

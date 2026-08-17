@@ -11,7 +11,9 @@ Reference: https://github.com/Xilinx/XRT/blob/master/src/runtime_src/core/includ
 
 from __future__ import annotations
 import struct
+import json
 from dataclasses import dataclass, field
+from typing import Optional
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -19,7 +21,7 @@ import xml.etree.ElementTree as ET
 SECTION_KINDS: dict[int, str] = {
     0x00: "BITSTREAM",
     0x01: "CLEARING_BITSTREAM",
-    0x02: "CONNECTIVITY",           # XML connectivity/interface description
+    0x02: "EMBEDDED_METADATA",      # CONNECTIVITY XML lives here
     0x03: "FIRMWARE",
     0x04: "DEBUG_DATA",
     0x05: "SCHED_FIRMWARE",
@@ -40,14 +42,16 @@ SECTION_KINDS: dict[int, str] = {
     0x14: "PARTITION_METADATA",
     0x15: "EXE_AFFINITY_MAP",
     0x16: "SYSTEM_DT",
-    0x17: "SOFT_KERNEL",
+    0x17: "SOFT_KERNEL",            # In NPU xclbins: memory topology
     0x18: "ASK_FLASH",
     0x19: "AIE_PARTITION",          # Partition descriptor (col/row map)
     0x1A: "ASK_GROUP_TOPOLOGY",
     0x1B: "ASK_GROUP_CONNECTIVITY",
-    0x1C: "AIEBU",
+    0x1C: "AIEBU",                  # AIE Binary Utilities payload
     0x1D: "DEBUG_IP_LAYOUT_EXTENDED",
     0x20: "AIE_PARTITION_PDI",      # The big CDO/PDI blob for NPU2
+    # Aliases/alternative values observed in NPU2 xclbins
+    0x02: "CONNECTIVITY",           # Same slot re-used for XML connectivity
 }
 
 # ── AXLF header layout ───────────────────────────────────────────────────────
@@ -117,7 +121,7 @@ class AxlfSection:
         return self.kind == 0x02
 
     @property
-    def connectivity_xml(self) -> ET.Element | None:
+    def connectivity_xml(self) -> Optional[ET.Element]:
         if not self.is_connectivity:
             return None
         try:
@@ -126,7 +130,7 @@ class AxlfSection:
             return None
 
     @property
-    def mem_topology(self) -> list[dict] | None:
+    def mem_topology(self) -> Optional[list[dict]]:
         """Parse MEM_TOPOLOGY binary section."""
         if self.kind != 0x06:
             return None
@@ -149,7 +153,7 @@ class AxlfSection:
         return entries
 
     @property
-    def aie_partition_info(self) -> dict | None:
+    def aie_partition_info(self) -> Optional[dict]:
         """Parse AIE_PARTITION binary descriptor (kind=0x19)."""
         if self.kind != 0x19:
             return None
@@ -176,25 +180,25 @@ class Axlf:
     num_sections: int
     sections: list[AxlfSection]
 
-    def section(self, kind: int) -> AxlfSection | None:
+    def section(self, kind: int) -> Optional[AxlfSection]:
         for s in self.sections:
             if s.kind == kind:
                 return s
         return None
 
-    def section_by_name(self, name: str) -> AxlfSection | None:
+    def section_by_name(self, name: str) -> Optional[AxlfSection]:
         for s in self.sections:
             if s.kind_name == name or s.name == name:
                 return s
         return None
 
     @property
-    def aie_pdi(self) -> AxlfSection | None:
+    def aie_pdi(self) -> Optional[AxlfSection]:
         """Returns the big AIE partition PDI section (kind=0x20)."""
         return self.section(0x20)
 
     @property
-    def kernel_name(self) -> str | None:
+    def kernel_name(self) -> Optional[str]:
         """Extract the MLIR_AIE kernel name from CONNECTIVITY XML."""
         conn = self.section(0x02)
         if conn is None:

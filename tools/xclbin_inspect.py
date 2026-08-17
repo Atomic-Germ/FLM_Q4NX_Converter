@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bn/env python3
 """
 xclbin_inspect.py — CLI tool: inspect an xclbin, extract sections, dump DMA topology
 
@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import axlf as axlf_mod
 import cdo as cdo_mod
+import txn as txn_mod
 
 
 def cmd_inspect(args):

@@ -35,9 +35,17 @@ class QWEN35_A3B(__Q4NX_Converter, model_arch=ModelArch.QWEN35_A3B):
                 target_dtype = self.gguf_tensors["token_embd.weight"].get_used_quantization_type(GGMLQuantizationType.Q8_0)
                 self.q4nx_tensors["lm_head.weight"] = self._pack(*unpacked, tensor_type=target_dtype)
 
+            num_blocks = self.gguf_reader.fields.get("qwen35moe.block_count")
+            num_blocks_val = num_blocks.contents() if num_blocks else None
+            import re
+
             for key, gguf_tensor in self.gguf_tensors.items():
                 if ".nextn." in gguf_tensor.name:
                     print(f"[SKIP] {gguf_tensor.name} (MTP next-token prediction weights, absent from official Q4NX)")
+                    continue
+                m = re.match(r"^blk\.(\d+)\.", gguf_tensor.name)
+                if m and num_blocks_val is not None and int(m.group(1)) >= num_blocks_val:
+                    print(f"[SKIP] {gguf_tensor.name} (layer {m.group(1)} >= block_count {num_blocks_val}, absent from official Q4NX)")
                     continue
                 if gguf_tensor.name not in self.forward_name_map:
                     # Some GGUFs ship an extra unquantized copy of alpha/beta

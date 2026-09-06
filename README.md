@@ -1,6 +1,15 @@
-# FLM Q4NX Converter
+# FLM Q4NX Converter (Enhanced Fork)
 
-A utility for converting GGUF model files into the Q4NX format. This tool supports converting language, vision, and audio model weights.
+A utility for converting GGUF model files into the Q4NX format for the AMD XDNA NPU and FastFlowLM (FLM). This tool supports converting language, vision, and audio model weights.
+
+> **Note on this Fork:**
+> This repository merges the latest official AMD ROCm Q4_K engine with the excellent tooling and ergonomics developed by [@Atomic-Germ](https://github.com/Atomic-Germ/FLM_Q4NX_Converter), along with essential stability and quantization fixes for FastFlowLM v1.0.3+:
+> 
+> - **FastFlowLM v1.0.3+ Q4_K Super-Block MoE Support**: Packed with official 4,736-byte Q4_K super-blocks (`_pack_q4k` layout mirroring `q4k_block_t` in FLM decoding kernels). Resolves the infinite decoding loop (`////...`) and `SIGSEGV` errors caused by legacy Q4_1 MoE conversions.
+> - **Integrated Atomic-Germ UX Tools**: Includes `flm-add.py`, `--deploy` / `-d` and `--deploy-from` in `convert.py`, automated model registration in `~/.config/flm/model_list.json`, automatic xclbin symlinking, metadata extraction (`chat_template.jinja`, `tokenizer.json`), and diagnostic utilities in `tools/`.
+> - **Multi-Dimensional Re-Quantization Fix**: Fixed handling in `q4nx/gguf_tensor.py` for 3D MoE expert weights (such as `blk.*.ffn_down_exps.weight` with shapes like `[512, 2048, 256]`), allowing fine-tunes with Q6_K / other quantization types to cleanly re-quantize to Q4_K.
+> - **Tied Embedding Fix**: Retains proper separate embedding weights for architectures like Qwen 3.5 4B to prevent vocabulary corruption.
+> - **GGUF Quantization Priority**: Added automatic preference for `q4_k_m` and `q4_k` when downloading or converting Qwen 3.5 and Qwen 3.5 MoE models.
 
 ## Supported Models
 Based on the configuration, the converter supports several model architectures, including:
@@ -13,7 +22,8 @@ Based on the configuration, the converter supports several model architectures, 
 - Qwen 2 VL
 - Qwen 3
 - Qwen 3 VL
-- Qwen 3.5
+- Qwen 3.5 (including 0.8B, 2B, 4B, 9B, and Omni)
+- Qwen 3.5 MoE / Qwen 3.6 MoE (35B-A3B and custom fine-tunes)
 
 ### Weight Type Support
 - `language`: supported for model families in `configs/`

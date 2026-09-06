@@ -388,13 +388,16 @@ class GGUFTensor:
         if len(self.shape) < 2:
             wants_quantized_target = False
 
-        if is_native_float and not wants_quantized_target:
-            if self.tensor_type == GGMLQuantizationType.F32:
-                return [torch.Tensor(np.array(self.data.view(np.float32)))]
-            elif self.tensor_type == GGMLQuantizationType.F16:
-                return [torch.Tensor(np.array(self.data.view(np.float16).astype(np.float32)))]
-            else:  # BF16
-                return [torch.from_numpy(self.data.copy()).view(torch.bfloat16)]
+        if not wants_quantized_target:
+            if is_native_float:
+                if self.tensor_type == GGMLQuantizationType.F32:
+                    return [torch.Tensor(np.array(self.data.view(np.float32)))]
+                elif self.tensor_type == GGMLQuantizationType.F16:
+                    return [torch.Tensor(np.array(self.data.view(np.float16).astype(np.float32)))]
+                else:  # BF16
+                    return [torch.from_numpy(self.data.copy()).view(torch.bfloat16)]
+            else:
+                return self._requantize_to(default_tensor_type)
 
         elif self.tensor_type == GGMLQuantizationType.Q4_0:
             return self.unpack_q4_0(self.data, self.shape[0])
@@ -407,7 +410,9 @@ class GGUFTensor:
         elif self.tensor_type == GGMLQuantizationType.MXFP4:
             return self.unpack_mxfp4(self.data, self.shape[0])
         elif self.tensor_type == GGMLQuantizationType.Q4_K:
-            return self.unpack_q4_k(self.data, self.shape[0])
+            if default_tensor_type == GGMLQuantizationType.Q4_K:
+                return self.unpack_q4_k(self.data, self.shape[0])
+            return self._requantize_to(default_tensor_type)
         else:
             """
                 If the tensor type is not natively packable as-is (either a

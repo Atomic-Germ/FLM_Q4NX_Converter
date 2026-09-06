@@ -433,8 +433,9 @@ class GGUFTensor:
                 return [w]
 
             if default_tensor_type == GGMLQuantizationType.Q4_K:
-                w_f32 = w.to(torch.float32)
-                rows, cols = w_f32.shape[0], w_f32.shape[1]
+                cols = self.shape[0]
+                w_f32 = w.to(torch.float32).reshape(-1, cols)
+                rows = w_f32.shape[0]
                 groups = w_f32.view(rows, cols // 32, 32)
                 w_min = groups.amin(dim=-1)
                 w_max = groups.amax(dim=-1)
@@ -446,7 +447,7 @@ class GGUFTensor:
 
             target_type = default_tensor_type
 
-            w = w.to(torch.float32).numpy()
+            w = w.to(torch.float32).reshape(-1, self.shape[0]).numpy()
             data_quantized = quantize(w, target_type).copy()
             if target_type == GGMLQuantizationType.Q4_1:
                 d, m, qw = self.unpack_q4_1(data_quantized, self.shape[0])
@@ -458,6 +459,11 @@ class GGUFTensor:
                 raise ValueError(f"Unsupported tensor type: {target_type.name}")
             return d, m, qw
         except Exception as e:
+            if default_tensor_type == GGMLQuantizationType.Q4_K:
+                raise RuntimeError(
+                    f"Failed to quantize {self.tensor_type.name} tensor "
+                    f"(shape {list(self.shape)}) to Q4_K: {e}"
+                ) from e
             print(
                 f"[WARN] Could not quantize {self.tensor_type.name} tensor "
                 f"(shape {list(self.shape)}) to {default_tensor_type.name}: {e}; "

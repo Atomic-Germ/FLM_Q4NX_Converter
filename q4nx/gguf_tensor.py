@@ -365,51 +365,99 @@ class GGUFTensor:
             return default_tensor_type
 
     def unpack(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
-        if self.tensor_type == GGMLQuantizationType.F32:
-            return [torch.Tensor(np.array(self.data.view(np.float32)))]
-        elif self.tensor_type == GGMLQuantizationType.F16:
-            return [torch.Tensor(np.array(self.data.view(np.float16).astype(np.float32)))]
-        elif self.tensor_type == GGMLQuantizationType.BF16:
-            return [torch.from_numpy(self.data.copy()).view(torch.bfloat16)]
+        # A tensor that is stored in the GGUF at float/bfloat precision might
+        # still need to be quantized into the model's target format (e.g. Q4_1
+        # or Q8_0) if default_tensor_type requests it. Conversely, if the
+        # target format is BF16/F16/F32, or if the config leaves it at float
+        # precision (no per-tensor quantization at all) -- we must still
+        # quantize+pack the tensor into that format below. Otherwise the
+        # weight is left oversized and in the wrong (unpacked) layout,
+        # which the NPU runtime cannot read and crashes on.
+        is_native_float = self.tensor_type in (
+            GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16
+        )
+        wants_quantized_target = default_tensor_type in (
+            GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q8_0, GGMLQuantizationType.Q4_K
+        )
+        # The Q4_0/Q4_1/Q8_0 block-quantized formats only make sense for 2D
+        # matmul weight matrices; 1D tensors (e.g. rope_freqs, biases) are
+        # never packed this way even when a config entry is missing and
+        # falls back to the global default_tensor_type. Treat those as
+        # native float passthrough regardless of the requested target.
+        if len(self.shape) < 2:
+            wants_quantized_target = False
+
+        if is_native_float and not wants_quantized_target:
+            if self.tensor_type == GGMLQuantizationType.F32:
+                return [torch.Tensor(np.array(self.data.view(np.float32)))]
+            elif self.tensor_type == GGMLQuantizationType.F16:
+                return [torch.Tensor(np.array(self.data.view(np.float16).astype(np.float32)))]
+            else:  # BF16
+                return [torch.from_numpy(self.data.copy()).view(torch.bfloat16)]
 
         elif self.tensor_type == GGMLQuantizationType.Q4_0:
             return self.unpack_q4_0(self.data, self.shape[0])
         elif self.tensor_type == GGMLQuantizationType.Q4_1:
             return self.unpack_q4_1(self.data, self.shape[0])
         elif self.tensor_type == GGMLQuantizationType.Q8_0:
-            return self.unpack_q8_0(self.data, self.shape[0])
+            if default_tensor_type == GGMLQuantizationType.Q8_0:
+                return self.unpack_q8_0(self.data, self.shape[0])
+            return self._requantize_to(default_tensor_type)
         elif self.tensor_type == GGMLQuantizationType.MXFP4:
             return self.unpack_mxfp4(self.data, self.shape[0])
         elif self.tensor_type == GGMLQuantizationType.Q4_K:
             return self.unpack_q4_k(self.data, self.shape[0])
         else:
             """
-                If the tensor type is not supported, try to dequantize it and then quantize it back
-                to a supported intermediate type before packing.
+                If the tensor type is not natively packable as-is (either a
+                truly unsupported GGUF quant type such as Q5_K/Q6_K, or
+                a native F32/F16/BF16 tensor that the caller wants quantized
+                to a target), dequantize and quantize to intermediate supported type.
             """
-            intermediate_quant_type = default_tensor_type
+            if wants_quantized_target and self.shape and self.shape[-1] % 32 != 0:
+                w = dequantize(self.data, self.tensor_type)
+                w = torch.from_numpy(w).contiguous()
+                if self.tensor_type == GGMLQuantizationType.BF16:
+                    w = w.view(torch.bfloat16)
+                return [w]
+            return self._requantize_to(default_tensor_type)
+
+    def _requantize_to(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
+        """Dequantize the source tensor and re-quantize it into the requested
+        target format, returning a (d, m, qw) tuple ready for packing."""
+        try:
+            w = dequantize(self.data, self.tensor_type)
+            w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
+
+            if default_tensor_type == GGMLQuantizationType.BF16:
+                return [w]
+
+            target_type = default_tensor_type
             if default_tensor_type == GGMLQuantizationType.Q4_K:
-                # GGML cannot encode into Q4_K directly; encode into Q4_1 to get per-group scale/min and quants,
-                # which _pack_q4k will then fit into Q4_K super-blocks.
-                intermediate_quant_type = GGMLQuantizationType.Q4_1
-            if default_tensor_type in (GGMLQuantizationType.BF16, GGMLQuantizationType.F16,
-                                       GGMLQuantizationType.F32):
-                return [self.dequantize()]
+                target_type = GGMLQuantizationType.Q4_1
+
+            w = w.to(torch.float32).numpy()
+            data_quantized = quantize(w, target_type).copy()
+            if target_type == GGMLQuantizationType.Q4_1:
+                d, m, qw = self.unpack_q4_1(data_quantized, self.shape[0])
+            elif target_type == GGMLQuantizationType.Q4_0:
+                d, m, qw = self.unpack_q4_0(data_quantized, self.shape[0])
+            elif target_type == GGMLQuantizationType.Q8_0:
+                d, m, qw = self.unpack_q8_0(data_quantized, self.shape[0])
+            else:
+                raise ValueError(f"Unsupported tensor type: {target_type.name}")
+            return d, m, qw
+        except Exception as e:
+            print(
+                f"[WARN] Could not quantize {self.tensor_type.name} tensor "
+                f"(shape {list(self.shape)}) to {default_tensor_type.name}: {e}; "
+                "keeping it as a float passthrough instead of crashing."
+            )
             try:
                 w = dequantize(self.data, self.tensor_type)
-                w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
-                
-                w = w.to(torch.float32).numpy()
-                data_quantized = quantize(w, intermediate_quant_type).copy()
-                if intermediate_quant_type == GGMLQuantizationType.Q4_1:
-                    d, m, qw = self.unpack_q4_1(data_quantized, self.shape[0])
-                elif intermediate_quant_type == GGMLQuantizationType.Q4_0:
-                    d, m, qw = self.unpack_q4_0(data_quantized, self.shape[0])
-                elif intermediate_quant_type == GGMLQuantizationType.Q8_0:
-                    d, m, qw = self.unpack_q8_0(data_quantized, self.shape[0])
-                else:
-                    raise ValueError(f"Unsupported tensor type: {intermediate_quant_type.name}")
-                return d, m, qw
-            except Exception as e:
-                print(f"Error unpacking {self.tensor_type.name}: {e}")
+                w = torch.from_numpy(np.array(w)).contiguous()
+                if self.tensor_type == GGMLQuantizationType.BF16:
+                    w = w.view(torch.bfloat16)
+                return [w]
+            except Exception:
                 return None, None, None

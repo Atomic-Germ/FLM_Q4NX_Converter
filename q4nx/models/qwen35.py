@@ -36,6 +36,9 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 self.q4nx_tensors["lm_head.weight"] = self._pack(*unpacked, tensor_type=target_dtype)
 
             for key, gguf_tensor in self.gguf_tensors.items():
+                if ".nextn." in gguf_tensor.name:
+                    print(f"[SKIP] {gguf_tensor.name} (MTP next-token prediction weights, absent from official Q4NX)")
+                    continue
                 if gguf_tensor.name not in self.forward_name_map:
                     # Some GGUFs ship an extra unquantized copy of alpha/beta
                     # (blk.{bid}.ssm_{alpha,beta}.bf16.weight).  The bf16 copy is
@@ -204,7 +207,7 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
         else:
             raise ValueError(f"Unsupported weights_type: {weights_type} for Qwen35 model")
 
-        self._export_q4nx_tensors(q4nx_path)
+        self._export_weights(q4nx_path, weights_type)
 
 
 class Qwen35_2B(Qwen35, model_arch=ModelArch.QWEN35_2B):

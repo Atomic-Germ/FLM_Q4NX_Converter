@@ -2,10 +2,10 @@
 
 from abc import ABC, abstractmethod
 from gguf import GGUFReader
-from .constants import ModelArch, ModelArchNames
-from .constants import ModelArchConfigs
+from .constants import ModelArch, ModelArchNames, ModelArchConfigs, QWEN35_VARIANT_DIMS
+from .arch_detect import detect_model_family, resolve_override_arch
 from .gguf_tensor import GGUFTensor, GGMLQuantizationType, _refit_one_side
-from typing import List, Dict, Type
+from typing import List, Dict, Type, Optional
 import os
 import json
 import re
@@ -217,10 +217,36 @@ class __Q4NX_Converter(ABC):
                 return True 
         return False
 
-    def _export_q4nx_tensors(self, q4nx_path: str):
-        print(f"[INFO] Saving Q4NX tensors to {q4nx_path}/model.q4nx...")
+    def _export_q4nx_tensors(self, q4nx_path: str, filename: str = "model.q4nx"):
+        if q4nx_path.endswith(filename):
+            print(f"[INFO] Saving Q4NX tensors to {q4nx_path}...")
+            os.makedirs(os.path.dirname(q4nx_path) or ".", exist_ok=True)
+            save_file(self.q4nx_tensors, q4nx_path)
+            return
+        print(f"[INFO] Saving Q4NX tensors to {q4nx_path}/{filename}...")
         create_dir_if_not_exists(q4nx_path)
-        save_file(self.q4nx_tensors, os.path.join(q4nx_path, "model.q4nx"))
+        save_file(self.q4nx_tensors, os.path.join(q4nx_path, filename))
+
+    def _export_weights(self, q4nx_path: str, weights_type: str = "language"):
+        """Export the current tensor dict to the file expected by the FLM
+        runtime for the given weight type.
+
+        The runtime reads the file name for vision/audio weights from the
+        model's config.json (``vision_model_weight`` / ``audio_model_weight``).
+        The names used by the official FLM model repos are:
+          - language -> model.q4nx
+          - vision   -> vision_weight.q4nx  (qwen2vl uses vision_weights.q4nx)
+          - audio    -> audio_weight.q4nx
+        """
+        if weights_type == "language":
+            filename = "model.q4nx"
+        elif weights_type == "vision":
+            filename = self.q4nx_config.get("vision_config", {}).get("vision_file", "vision_weight.q4nx")
+        elif weights_type == "audio":
+            filename = self.q4nx_config.get("audio_config", {}).get("audio_file", "audio_weight.q4nx")
+        else:
+            raise ValueError(f"Unsupported weights_type: {weights_type}")
+        self._export_q4nx_tensors(q4nx_path, filename=filename)
 
     def _pack_MXFP4_q4nx(self, scales:torch.Tensor, data:torch.Tensor,    
             )->torch.Tensor:
@@ -1108,13 +1134,11 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
     """
     
     if override_model_arch != "":
-        for arch_enum, arch_names in ModelArchNames.items():
-            for arch_name in arch_names:            
-                if override_model_arch.lower().startswith(arch_name.lower()):
-                    return arch_enum
+        best_match = resolve_override_arch(override_model_arch)
+        if best_match is not None:
+            return best_match
         print("Warning: Did not find matching override model arch, attempting to load base on gguf information")
 
-    
     # Get architecture from GGUF metadata
     # The architecture is typically stored in the 'general.architecture' field
     arch_str:str|None = None
@@ -1125,21 +1149,51 @@ def get_model_arch_from_gguf(reader: GGUFReader, override_model_arch:str="") -> 
         elif field.name == 'general.basename':
             basename_str = str(field.parts[field.data[0]], encoding='utf-8') if field.data else None
     
-
     # Map the architecture string to ModelArch enum
-    for arch_enum, arch_names in ModelArchNames.items():
-        for arch_name in arch_names:
-            if arch_str.lower() == arch_name.lower():
-                return arch_enum
-    
+    if arch_str is not None:
+        for arch_enum, arch_names in ModelArchNames.items():
+            for arch_name in arch_names:
+                if arch_str.lower() == arch_name.lower():
+                    return arch_enum
 
-    for arch_enum, arch_names in ModelArchNames.items():
-        for arch_name in arch_names:
-            if basename_str.lower().startswith(arch_name.lower()):
-                return arch_enum
+    # llama.cpp reports the Qwen3.5 architecture without a size suffix
+    # (general.architecture == 'qwen35'), so infer the variant from the
+    # embedding dimension.
+    if arch_str is not None and arch_str.lower() in ("qwen35", "qwen3.5"):
+        field = reader.fields.get("qwen35.embedding_length")
+        if field is not None:
+            dim = field.contents()
+            for variant, expected_dim in QWEN35_VARIANT_DIMS.items():
+                if dim == expected_dim:
+                    return variant
 
+    if basename_str is not None:
+        for arch_enum, arch_names in ModelArchNames.items():
+            for arch_name in arch_names:
+                if basename_str.lower().startswith(arch_name.lower()):
+                    return arch_enum
 
-    raise ValueError(f"Unsupported model architecture: {arch_str}")
+    # --- heuristic fallback: "close enough" guess the user can refine ---
+    guesses = detect_model_family(reader)
+    for guess in guesses:
+        if guess.arch not in _MODEL_REGISTRY:
+            continue
+        print("[WARN] general.architecture was missing or unrecognized; using a heuristic guess.")
+        print(f"[WARN] Best guess: {guess.arch.name} ({guess.confidence} confidence).")
+        for reason in guess.reasons:
+            print(f"         - {reason}")
+        if len(guesses) > 1:
+            others = ", ".join(
+                f"{g.arch.name} ({g.confidence})" for g in guesses if g.arch != guess.arch
+            )
+            print(f"[WARN] Other candidates: {others}")
+        print("[WARN] If this is wrong, force the type with -f <arch-name>.")
+        return guess.arch
+
+    raise ValueError(
+        f"Unsupported model architecture: {arch_str or basename_str or '(no general.architecture field)'}. "
+        "Use -f to force the model type."
+    )
 
 
 def get_registered_models() -> Dict[ModelArch, Type['__Q4NX_Converter']]:
@@ -1173,7 +1227,6 @@ def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converte
     # Read the architecture from the GGUF file
     reader = GGUFReader(gguf_path)
     model_arch = get_model_arch_from_gguf(reader,override_model_arch )
-
     
     # Look up the appropriate converter class
     if model_arch not in _MODEL_REGISTRY:
@@ -1188,3 +1241,25 @@ def create_converter(gguf_path: str, override_model_arch:str) -> __Q4NX_Converte
     converter_instance = converter_class(reader)
 
     return converter_instance
+
+
+def create_hf_converter(
+    hf_source: str, override_model_arch: str = "", config_json_path: str | None = None
+) -> __Q4NX_Converter:
+    """Factory for HF-safetensors-source converters.
+
+    Only the Qwen3.5 MoE converter supports an HF source for now.
+    """
+    if override_model_arch:
+        model_arch = resolve_override_arch(override_model_arch)
+    else:
+        model_arch = ModelArch.QWEN35MOE
+
+    if model_arch != ModelArch.QWEN35MOE:
+        raise ValueError(
+            f"No HF-safetensors converter for architecture: "
+            f"{ModelArchNames.get(model_arch, model_arch) if model_arch is not None else override_model_arch}. "
+            "HF-direct conversion is only supported for qwen35moe."
+        )
+    converter_class = _MODEL_REGISTRY[ModelArch.QWEN35MOE]
+    return converter_class(hf_source, config_json_path=config_json_path)

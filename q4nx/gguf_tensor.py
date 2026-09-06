@@ -358,12 +358,9 @@ class GGUFTensor:
     def get_used_quantization_type(self, default_tensor_type: GGMLQuantizationType) -> GGMLQuantizationType:
         if default_tensor_type in (GGMLQuantizationType.BF16, GGMLQuantizationType.F16, GGMLQuantizationType.F32):
             return default_tensor_type
-        if self.tensor_type in [GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16, GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q8_0, GGMLQuantizationType.MXFP4, GGMLQuantizationType.Q4_K]:
+        if self.tensor_type == default_tensor_type:
             return self.tensor_type
-        else:
-            # For unsupported source types (e.g. Q5_K, Q6_K), return default_tensor_type so
-            # downstream packing dispatches to the correct target layout (e.g. _pack_q4k).
-            return default_tensor_type
+        return default_tensor_type
 
     def unpack(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
         # A tensor that is stored in the GGUF at float/bfloat precision might

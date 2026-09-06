@@ -360,11 +360,8 @@ class GGUFTensor:
         if self.tensor_type in [GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16, GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q8_0, GGMLQuantizationType.MXFP4, GGMLQuantizationType.Q4_K]:
             return self.tensor_type
         else:
-            # For unsupported types, we will dequantize and then quantize to default_tensor_type.
-            # Q4_K is a read-only format here -- nothing can encode into it -- so a
-            # config asking for it as the fallback target gets Q4_1 instead.
-            if default_tensor_type == GGMLQuantizationType.Q4_K:
-                return GGMLQuantizationType.Q4_1
+            # For unsupported source types (e.g. Q5_K, Q6_K), return default_tensor_type so
+            # downstream packing dispatches to the correct target layout (e.g. _pack_q4k).
             return default_tensor_type
 
     def unpack(self, default_tensor_type: GGMLQuantizationType) -> np.ndarray:
@@ -387,35 +384,31 @@ class GGUFTensor:
             return self.unpack_q4_k(self.data, self.shape[0])
         else:
             """
-                If the tensor type is not supported, try to dequantize it and then quantize it back to Q4_1
-                This is a workaround for the fact that the GGUF format does not support all tensor types
-                and we need to convert it to a supported type before converting to Q4NX
+                If the tensor type is not supported, try to dequantize it and then quantize it back
+                to a supported intermediate type before packing.
             """
-            # Q4_K does not come here: it has a direct path above. Stacking a
-            # dequantize onto a re-quantize costs 0.240 bits of ENOB *and* 0.375
-            # bpw against reading it natively, and damages the tail far more than
-            # the mean (see quant.md).  q5/q6 still take this path.
+            intermediate_quant_type = default_tensor_type
             if default_tensor_type == GGMLQuantizationType.Q4_K:
-                default_tensor_type = GGMLQuantizationType.Q4_1  # nothing can encode Q4_K
+                # GGML cannot encode into Q4_K directly; encode into Q4_1 to get per-group scale/min and quants,
+                # which _pack_q4k will then fit into Q4_K super-blocks.
+                intermediate_quant_type = GGMLQuantizationType.Q4_1
             if default_tensor_type in (GGMLQuantizationType.BF16, GGMLQuantizationType.F16,
                                        GGMLQuantizationType.F32):
-                # An unquantized target only needs the dequantize; ggml's quantize()
-                # has no encoder for these, so the branch below would raise.
                 return [self.dequantize()]
             try:
                 w = dequantize(self.data, self.tensor_type)
                 w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
                 
                 w = w.to(torch.float32).numpy()
-                data_quantized = quantize(w, default_tensor_type).copy()
-                if default_tensor_type == GGMLQuantizationType.Q4_1:
+                data_quantized = quantize(w, intermediate_quant_type).copy()
+                if intermediate_quant_type == GGMLQuantizationType.Q4_1:
                     d, m, qw = self.unpack_q4_1(data_quantized, self.shape[0])
-                elif default_tensor_type == GGMLQuantizationType.Q4_0:
+                elif intermediate_quant_type == GGMLQuantizationType.Q4_0:
                     d, m, qw = self.unpack_q4_0(data_quantized, self.shape[0])
-                elif default_tensor_type == GGMLQuantizationType.Q8_0:
+                elif intermediate_quant_type == GGMLQuantizationType.Q8_0:
                     d, m, qw = self.unpack_q8_0(data_quantized, self.shape[0])
                 else:
-                    raise ValueError(f"Unsupported tensor type: {default_tensor_type.name}")
+                    raise ValueError(f"Unsupported tensor type: {intermediate_quant_type.name}")
                 return d, m, qw
             except Exception as e:
                 print(f"Error unpacking {self.tensor_type.name}: {e}")

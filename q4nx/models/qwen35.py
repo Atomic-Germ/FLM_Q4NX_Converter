@@ -46,10 +46,6 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                 target_dtype = gguf_tensor.get_used_quantization_type(self.tensor_q4nx_type_map[gguf_tensor.name])
                 print(f"Processing tensor: {gguf_tensor.name} with type {gguf_tensor.tensor_type.name} -> {self.forward_name_map[gguf_tensor.name]} with dtype {target_dtype.name}")
                 if "token_embd.weight" in gguf_tensor.name: # this should be bf16
-                    if tied_embedding:
-                        # lm_head.weight above already carries these weights; skip the bf16 duplicate
-                        print("[INFO] Tied embedding, skipping bf16 copy of token_embd.weight")
-                        continue
                     w = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
                     w = torch.from_numpy(w).contiguous().to(torch.bfloat16)
                     self.q4nx_tensors[self.forward_name_map[gguf_tensor.name]] = w
@@ -126,9 +122,9 @@ class Qwen35(__Q4NX_Converter, model_arch=ModelArch.QWEN35_4B):
                         if reorder_linear_required:
                             w = rearrange(w, '(q g) c -> (g q) c', q = 2).contiguous()
 
-                        # new_name = self.forward_name_map[gguf_tensor.name]
-                        # new_name = new_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
-                        # self.q4nx_tensors[new_name] = w  sdfsdf
+                        new_name = self.forward_name_map[gguf_tensor.name]
+                        new_name = new_name.replace("alpha_proj", "alpha_proj.bf16").replace("beta_proj", "beta_proj.bf16")
+                        self.q4nx_tensors[new_name] = w
                         if reorder_linear_required:
                             print(f"[INFO] Reorder for {self.forward_name_map[gguf_tensor.name]}")
                             d = rearrange(d, '(q g) c -> (g q) c', q = 2).contiguous()

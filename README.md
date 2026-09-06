@@ -114,19 +114,17 @@ python convert.py -i gemma4-2b-mmproj.gguf -o unsloth-gemma4-2b-audio -t audio -
 ```bash
 python convert.py -i model.gguf -o output_folder
 ```
-The converter automatically dequantizes non-Q4_0/Q4_1 weights and re-quantizes them into Q4NX. See the [Converting from Other Quantization Formats](#converting-from-other-quantization-formats) section for details.
+The converter automatically dequantizes non-native weights and re-quantizes them into the target layout required by the architecture (e.g. Q4_K for MoE models, Q4_1/Q4_0 for dense models). See the [Converting from Other Quantization Formats](#converting-from-other-quantization-formats) section for details.
 
 ## Converting from Other Quantization Formats
 
-The converter supports GGUF models that use quantization formats other than Q4_0 or Q4_1, such as **Q4_K_M**, **Q8_0**, **Q5_K_M**, and others. When the converter encounters weights in a non-native format, it automatically dequantizes them back to floating point and then re-quantizes them into the Q4NX target format.
-
-This means you are not limited to sourcing GGUF files that are already in Q4_0 or Q4_1 — you can use a wider variety of community-quantized models as input.
+The converter supports GGUF models across a wide variety of quantization formats, such as **Q4_K_M**, **Q4_K_S**, **Q8_0**, **Q5_K_M**, **Q6_K**, **BF16**, and others. When the converter encounters weights in a format different from the target architecture layout, it automatically dequantizes them to floating point and re-quantizes them into the exact format expected by FastFlowLM.
 
 The conversion process works as follows:
 
-1. The converter reads the quantization type of each tensor from the GGUF file.
-2. If the tensor is not already in the expected format (Q4_0 or Q4_1, depending on the model config), it is dequantized to FP32.
-3. The dequantized weights are then re-quantized into the target format required by FLM.
+1. The converter inspects the source quantization type of each tensor in the GGUF file.
+2. If a tensor is not already in the target format defined in the model config (e.g. `Q4_K` super-blocks for MoE, `Q4_1`/`Q4_0` for dense models, `Q8_0` for lm_head, or `BF16` for sensitive layers), it is dequantized.
+3. The dequantized weights are then packed into the precise memory layout required by the AMD XDNA NPU decoding kernels.
 
 This process is fully automatic and requires no additional flags beyond **`-f`** if the architecture cannot be auto-detected.
 
@@ -522,14 +520,31 @@ flm serve qwen3vl-it:4b-custom
 
 
 ## Project Structure
-- `convert.py`: The main CLI script for running conversions.
-- `setup_venv.sh`: Initializes the Python virtual environment and installs dependencies.
-- `activate.sh`: Activates the virtual environment and sets up environment variables.
-- `q4nx/`: Core package containing the conversion logic, gguf tensor parsing, and model-specific implementations.
-- `configs/`: JSON configuration files for supported model architectures.
 
+- `convert.py`: Main CLI script for model conversion, automatic architecture detection, quantization packing, asset retrieval, and optional automated deployment (`-d` / `--deploy-from`).
+- `flm-add.py`: Standalone CLI tool (Python stdlib only) to download pre-converted models or Hugging Face / ModelScope repositories, register them in `~/.config/flm/model_list.json`, and automatically symlink matching hardware XCLBIN kernels.
+- `q4nx/`: Core conversion library:
+  - `arch_detect.py`: Automatic model family and architecture heuristics.
+  - `deploy.py`: Automated model deployment, registry configuration, and XCLBIN symlinking.
+  - `model_assets.py`: Automatic extraction and fetching of configs, chat templates, and tokenizers.
+  - `gguf_tensor.py`: GGUF parsing, multi-format dequantization, 3D tensor reshape, and quantization packing (Q4_K, Q4_1, Q4_0, Q8_0, MXFP4).
+  - `models/`: Architecture-specific converters (Qwen 3.5 MoE / 3.6 MoE, Qwen 3.5 dense, Gemma 3/4, GPT-OSS, LLaMA, Phi-4, LFM 2, Nanbeige, etc.).
+- `configs/`: JSON configuration definitions, parameter maps, and hardware memory offsets (`addr_qk`, `addr_kv`, `addr_kk`, `addr_l_begin_mha`, `addr_l_end_mha`).
+- `tools/`: Diagnostic and verification suite (`analyze_xclbins.py`, `verify_moe_q4nx.py`, `verify_q4nx_quant.py`, `xclbin_catalog.py`, `axlf.py`, `cdo.py`, `txn.py`).
+- `setup_venv.sh` & `activate.sh`: Python virtual environment setup and activation scripts.
 
-## Known Issues
-- The converter outputs either Q4_0 or Q4_1 quantization format based on the setting in config files for each model. Input GGUF files can use other quantization formats — the converter will dequantize and re-quantize automatically, though this may introduce additional quantization error.
-- For GPT-OSS:20B models, the converter currently uses the original `model.embed_tokens.weight` from the safetensors from OpenAI due to issues with Q4_1 quantization (from our experience, Q4_1 quantization messes up the quantization of the embedding layer for this model). 
-  - **Workaround:** Place the [`model-00001-of-00001.safetensors`](https://huggingface.co/openai/gpt-oss-20b/tree/main) file in the root directory of this project before running the conversion for GPT-OSS. If the file is not found, the converter will print a warning and skip replacing the embedding weights. 
+## Quantization & Technical Notes
+
+- **FastFlowLM v1.0.3+ MoE Format (Q4_K Super-Blocks)**:
+  - 35B MoE models (such as Qwen 3.6 35B A3B and BigBang 35B) strictly require the **Q4_K super-block format** (4,736 bytes per 32×256 chunk) matching `q4k_block_t` in FLM v1.0.3 NPU decoding kernels.
+  - Converting MoE projection layers with the legacy Q4_1 format (5,120 bytes) causes infinite decoding loops (`////...`) or `SIGSEGV` errors under FLM v1.0.3+. This converter automatically packs all MoE projection layers into Q4_K super-blocks.
+- **Quantization Support & Dequantization**:
+  - The converter natively outputs **Q4_K** (MoE projections), **Q4_1** and **Q4_0** (dense models), **MXFP4** (GPT-OSS), and **Q8_0** (e.g. `lm_head.weight`), while preserving unquantized **BF16** and **FP32** precision for sensitive layers (such as SSM state space layers `ssm_alpha_proj`, `ssm_beta_proj`, `ssm_conv1d`, layernorms, biases, and routers).
+  - Source GGUFs can be in `Q4_K_M`, `Q4_K_S`, `Q5_K`, `Q6_K`, `Q8_0`, `BF16`, or `FP32`. Weights in formats different from the target layer specification are automatically dequantized and re-quantized.
+  - Multi-dimensional expert weights (such as 3D `blk.*.ffn_down_exps.weight`) are reshaped cleanly during re-quantization.
+- **Tied Embeddings**:
+  - Dense architectures such as Qwen 3.5 4B retain separate `model.embed_tokens.weight` tensors so vocabulary token mapping remains coherent.
+- **Multi-Token Prediction (MTP)**:
+  - Auxiliary MTP prediction heads beyond the model's base transformer layers (e.g. block 40 in 40-layer models) are automatically detected and omitted to conform to FLM's runtime memory allocation.
+- **GPT-OSS**:
+  - Embedding weights are dequantized directly into BF16 during conversion, removing the former requirement for an external `model-00001-of-00001.safetensors` file. 

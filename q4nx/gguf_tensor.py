@@ -432,9 +432,19 @@ class GGUFTensor:
             if default_tensor_type == GGMLQuantizationType.BF16:
                 return [w]
 
-            target_type = default_tensor_type
             if default_tensor_type == GGMLQuantizationType.Q4_K:
-                target_type = GGMLQuantizationType.Q4_1
+                w_f32 = w.to(torch.float32)
+                rows, cols = w_f32.shape[0], w_f32.shape[1]
+                groups = w_f32.view(rows, cols // 32, 32)
+                w_min = groups.amin(dim=-1)
+                w_max = groups.amax(dim=-1)
+                scale = torch.clamp((w_max - w_min) / 15.0, min=1e-8)
+                q = torch.clamp(torch.round((groups - w_min.unsqueeze(-1)) / scale.unsqueeze(-1)), 0, 15).view(rows, cols)
+                t = scale
+                u = -w_min
+                return t, u, q
+
+            target_type = default_tensor_type
 
             w = w.to(torch.float32).numpy()
             data_quantized = quantize(w, target_type).copy()

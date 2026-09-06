@@ -230,10 +230,10 @@
             "gguf_name" : "v.blk.{bid}.ln2.weight",
             "q4nx_name" : "model.visual.blocks.{bid}.norm2.weight"
         }
-
-
-
-
-
-    }
+    },
+    "addr_qk": 9216,
+    "addr_kv": 36864,
+    "addr_kk": 45056,
+    "addr_l_begin_mha": 53760,
+    "addr_l_end_mha": 25088
 }

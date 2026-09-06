@@ -1261,5 +1261,5 @@ def create_hf_converter(
             f"{ModelArchNames.get(model_arch, model_arch) if model_arch is not None else override_model_arch}. "
             "HF-direct conversion is only supported for qwen35moe."
         )
-    converter_class = _MODEL_REGISTRY[ModelArch.QWEN35MOE]
-    return converter_class(hf_source, config_json_path=config_json_path)
+    from .models.qwen35moe import Qwen35Moe
+    return Qwen35Moe(hf_source, config_json_path=config_json_path)

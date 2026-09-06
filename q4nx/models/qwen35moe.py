@@ -486,17 +486,22 @@ class Qwen35Moe(__Q4NX_Converter, model_arch=ModelArch.QWEN35MOE):
 
     def _store_q(self, q4nx_name: str, w: torch.Tensor):
         """Quantize + pack a 2D weight into the Q4NX block layout."""
-        target = (
-            GGMLQuantizationType.Q4_1
-            if q4nx_name.endswith(tuple(Qwen35Moe._Q4_1_NAMES))
-            else GGMLQuantizationType.Q8_0
-        )
-        w_np = w.to(torch.float32).numpy()
-        quantized = quantize(w_np, target).copy()
-        columns = w_np.shape[1]
-        if target == GGMLQuantizationType.Q4_1:
-            d, m, qw = GGUFTensor.unpack_q4_1(quantized, columns)
-            self.q4nx_tensors[q4nx_name] = self._pack(d, m, qw, tensor_type=target)
-        else:
+        if q4nx_name == "lm_head.weight":
+            target = GGMLQuantizationType.Q8_0
+            w_np = w.to(torch.float32).numpy()
+            quantized = quantize(w_np, target).copy()
+            columns = w_np.shape[1]
             d, _, qw = GGUFTensor.unpack_q8_0(quantized, columns)
             self.q4nx_tensors[q4nx_name] = self._pack(d, None, qw, tensor_type=target)
+        else:
+            target = GGMLQuantizationType.Q4_K
+            w_f32 = w.to(torch.float32)
+            rows, cols = w_f32.shape[0], w_f32.shape[1]
+            groups = w_f32.view(rows, cols // 32, 32)
+            w_min = groups.amin(dim=-1)
+            w_max = groups.amax(dim=-1)
+            scale = torch.clamp((w_max - w_min) / 15.0, min=1e-8)
+            q = torch.clamp(torch.round((groups - w_min.unsqueeze(-1)) / scale.unsqueeze(-1)), 0, 15).view(rows, cols)
+            t = scale
+            u = -w_min
+            self.q4nx_tensors[q4nx_name] = self._pack(t, u, q, tensor_type=target)

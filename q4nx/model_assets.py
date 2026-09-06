@@ -196,6 +196,9 @@ GGUF_QUANT_PRIORITY: Tuple[str, ...] = ("q4_1", "q4_0", "q8_0")
 GGUF_QUANT_PRIORITY_BY_FAMILY: Dict[str, Tuple[str, ...]] = {
     "lfm2": ("q4_0", "q4_1", "q8_0"),
     "gpt-oss": ("q4_1", "q4_0", "q8_0", "mxfp4"),
+    "qwen35moe": ("q4_k_m", "q4_k_s", "q4_k", "q4_1", "q4_0", "q8_0"),
+    "qwen3.6-moe": ("q4_k_m", "q4_k_s", "q4_k", "q4_1", "q4_0", "q8_0"),
+    "qwen3.5": ("q4_k_m", "q4_k_s", "q4_k", "q4_1", "q4_0", "q8_0"),
 }
 
 

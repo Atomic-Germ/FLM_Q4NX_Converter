@@ -1,0 +1,8 @@
+# Minimal set for convert.py (GGUF -> Q4NX) and --deploy, on Linux or Windows.
+# requirements.txt adds the HF-safetensors source path and the verifiers.
+torch
+einops
+safetensors
+numpy
+sentencepiece
+gguf @ git+https://github.com/ggml-org/llama.cpp.git#subdirectory=gguf-py

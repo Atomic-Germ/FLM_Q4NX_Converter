@@ -1,17 +1,23 @@
-"""Deploy converted models into the FLM runtime and register them.
+r"""Deploy converted models into the FLM runtime and register them.
 
 FLM resolves ``flm run <name>:<size>`` through ``model_list.json``: the tag maps to
 an entry whose ``name`` is the directory inside ``<models_root>/models/``, and whose
 ``details.family`` selects the runtime engine (``modelFamilyMap``). The weights are
 loaded from ``config.json`` in that directory.
 
-Because the system registry (``/opt/fastflowlm/share/flm/model_list.json``) is
-root-owned, we never write to it. Instead the converted model is copied into the
-user's models directory and registered in a user-level copy of the registry at
-``~/.config/flm/model_list.json``. Point ``FLM_CONFIG_PATH`` at that file so FLM
-picks it up:
+Because the system registry (``/opt/fastflowlm/share/flm/model_list.json``, or
+``%ProgramFiles%\flm\model_list.json`` on Windows) is owned by root/admin, we never
+write to it. Instead the converted model is copied (or hardlinked) into the user's
+models directory and registered in a user-level copy of the registry next to it
+(``~/.config/flm/model_list.json``; ``%USERPROFILE%\.flm\model_list.json`` on
+Windows, see q4nx/flm_paths.py). Point ``FLM_CONFIG_PATH`` at that file so FLM picks
+it up:
 
-    export FLM_CONFIG_PATH=$HOME/.config/flm/model_list.json
+    export FLM_CONFIG_PATH=$HOME/.config/flm/model_list.json        # Linux
+    setx FLM_CONFIG_PATH "%USERPROFILE%\.flm\model_list.json"       # Windows
+
+The entry is never added to ``model_info.json``: ``flm check`` treats files whose
+hash differs from that list as corrupt and deletes them.
 
 The new entry is derived from the official entry for the source model (same
 ``details.family`` so the same engine is dispatched, same ``size`` for the memlock
@@ -29,6 +35,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .constants import ModelArch
 from .arch_detect import ARCH_TO_FAMILY
+from . import flm_paths
+from .flm_paths import IS_WINDOWS, env_hint
 
 ARCH_TO_SIZE: Dict[ModelArch, str] = {
     ModelArch.QWEN35_08B: "0.8b",
@@ -82,7 +90,7 @@ def _tag_parts(tag: str) -> Tuple[str, str]:
 
 
 def find_flm_executable() -> Optional[str]:
-    return shutil.which("flm")
+    return flm_paths.find_flm_executable()
 
 
 def find_system_model_list() -> Path:
@@ -106,8 +114,7 @@ def find_system_model_list() -> Path:
 
 def get_models_root() -> Path:
     """Directory holding per-model folders, mirroring utils::get_models_directory."""
-    base = Path(os.environ["FLM_MODEL_PATH"]) if os.environ.get("FLM_MODEL_PATH") else Path.home() / ".config" / "flm"
-    return base / "models"
+    return flm_paths.user_flm_root() / "models"
 
 
 def get_user_registry_path() -> Path:
@@ -141,14 +148,15 @@ def find_system_xclbin_root() -> Optional[Path]:
 
 
 def _symlink(target: Path, link: Path) -> None:
-    if link.is_symlink() or link.exists():
-        if link.is_symlink() and os.readlink(link) == str(target):
-            return
-        if link.is_dir() and not link.is_symlink():
+    if flm_paths.is_dir_link(link):
+        flm_paths.link_dir(target, link)       # replaces a stale link, never follows it
+        return
+    if link.exists():
+        if link.is_dir():
             shutil.rmtree(link)
         else:
             link.unlink()
-    os.symlink(target, link)
+    flm_paths.link_dir(target, link)           # symlink, or a junction on Windows without symlink rights
 
 
 def link_model_xclbins(model_dir_name: str, source_dir_name: str) -> Optional[Path]:
@@ -289,8 +297,10 @@ def deploy_model(
     model_arch: ModelArch,
     model_dir_name: Optional[str] = None,
     deploy_from: Optional[str] = None,
+    hardlink: bool = False,
 ) -> dict:
-    """Copy the assembled model into FLM's models dir and register the tag.
+    """Copy (or, with ``hardlink``, hardlink) the assembled model into FLM's models
+    dir and register the tag.
 
     Returns a dict with the tag, target directory, source entry tag (if any) and
     the user registry path.
@@ -315,13 +325,24 @@ def deploy_model(
         print(f"[WARN] Overwriting existing model directory: {target}")
     os.makedirs(target, exist_ok=True)
     for filename in files:
-        shutil.copy2(output_dir / filename, target / filename)
+        how = flm_paths.place_file(output_dir / filename, target / filename, hardlink=hardlink)
+        if hardlink and how == "copy":
+            print(f"[WARN] Could not hardlink {filename} (different volume?); copied it instead")
 
     size_value = base_entry.get("size") if base_entry else None
     if size_value is None:
         size_value = _estimate_params(target / "config.json")
 
     entry = build_registry_entry(base_entry, model_dir_name, files, size_value)
+    source_dir_name = base_entry.get("name") if base_entry else None
+    # Windows only: symlinks there need admin rights. Newer FLM releases let an
+    # entry reuse another model's kernel folder ("xclbin_folder", e.g. the official
+    # DFlash2 drafters), so point the custom model at its parent's kernels directly.
+    # Linux keeps the existing symlinked xclbins tree.
+    use_xclbin_folder = (IS_WINDOWS and bool(source_dir_name)
+                         and flm_paths.registry_supports_xclbin_folder(system_registry))
+    if use_xclbin_folder:
+        entry["xclbin_folder"] = base_entry.get("xclbin_folder", source_dir_name)
     if not base_entry:
         family = ARCH_TO_FAMILY.get(model_arch, "")
         entry.setdefault("details", {}).setdefault("family", family)
@@ -337,19 +358,20 @@ def deploy_model(
     else:
         print("[WARN] No official registry entry found; wrote a minimal entry (family/size guesses).")
     if os.environ.get("FLM_CONFIG_PATH") != str(user_registry):
-        print(f"[INFO] FLM does not read this registry yet. Add to your shell rc:\n"
-              f"        export FLM_CONFIG_PATH={user_registry}")
+        print(f"[INFO] FLM does not read this registry yet. Set:\n"
+              f"        {env_hint('FLM_CONFIG_PATH', user_registry)}")
     else:
         print(f"[INFO] FLM_CONFIG_PATH already points at this registry. Ready to 'flm run {tag}'.")
 
-    source_dir_name = base_entry.get("name") if base_entry else None
-    if source_dir_name:
+    if use_xclbin_folder:
+        print(f"[INFO] Kernels: reusing '{entry['xclbin_folder']}' via xclbin_folder")
+    if source_dir_name and not use_xclbin_folder:
         user_xclbin_root = link_model_xclbins(model_dir_name, source_dir_name)
         if user_xclbin_root is not None:
             print(f"[INFO] Linked xclbins for '{model_dir_name}' -> '{source_dir_name}'")
             if os.environ.get("FLM_XCLBIN_PATH") != str(user_xclbin_root.parent):
-                print(f"[INFO] The runtime needs to find these xclbins. Add to your shell rc:\n"
-                      f"        export FLM_XCLBIN_PATH={user_xclbin_root.parent}")
+                print(f"[INFO] The runtime needs to find these xclbins. Set:\n"
+                      f"        {env_hint('FLM_XCLBIN_PATH', user_xclbin_root.parent)}")
             else:
                 print("[INFO] FLM_XCLBIN_PATH already points at the user xclbin tree.")
 

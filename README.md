@@ -15,6 +15,7 @@ Based on the configuration, the converter supports several model architectures, 
 - Qwen 3 VL
 - Qwen 3.5
 - Qwen 3.5 MoE
+- Qwen 3.8 27B (MTP, FLM q4_k), see [Qwen3.8-27B](#qwen38-27b-mtp-flm-q4_k)
 - Qwen 3.6 MoE
 
 ### Weight Type Support
@@ -511,6 +512,53 @@ flm serve qwen3vl-it:4b-custom
 ```
 
 
+
+## Qwen3.8-27B (MTP, FLM q4_k)
+
+Fine-tunes of Qwen3.8-27B (e.g. abliterated/uncensored builds) convert to the layout
+of the official `FastFlowLM/Qwen3.8-27B-NPU2` (FLM family `qwen3.8-mtp`, FLM 1.0.7+;
+tested on 1.0.12):
+
+```bash
+python convert.py -i Qwen3.8-27B-<finetune>-Q8_0.gguf -o Qwen3.8-27B-<finetune>-NPU2
+```
+
+Detected automatically (`qwen35` GGUF with `embedding_length` 5120); force it with `-f qwen3.8-27B`.
+
+What this converter does differently from the Qwen3.5 0.8B-9B one:
+
+- **Delta-net ratio 3** (48 value heads over 16 qk groups): the llama.cpp *tiled*
+  value-head order is permuted to the *grouped* order the engine uses (z gate, the v
+  part of `attn_qkv`, `ssm_out` columns, `ssm_alpha/beta`, `ssm_a`, `ssm_dt`, conv1d).
+- **The MTP block is kept**: the engine uses it for speculative decoding, so the GGUF
+  must contain it (`nextn_predict_layers = 1`, the last `blk`). It is written as
+  `model.mtp.fc` / `model.mtp.pre_fc_norm_{embedding,hidden}` / `model.mtp.norm` /
+  `model.mtp.layers.0.*`.
+- **FLM q4_k output** (4736-byte 32x256 chunks; `q4nx/q4k.py`) for the 4-bit
+  weights, and Q8NX for `embed_tokens`, `lm_head` and `ssm_alpha/beta`, as in the
+  official build. A native Q4_K source (e.g. Q4_K_M) is read without re-quantizing.
+  Other sources (Q8_0/BF16 are best) are encoded with a small range search, which
+  measured 2-4% lower error than the official build's own 4-bit weights.
+
+Only `model.q4nx` (+ `tokenizer.json`) is produced. Copy `config.json`,
+`tokenizer_config.json`, `chat_template.jinja` and `vision_weight.q4nx` from the
+official Qwen3.8-27B-NPU2 folder. A fine-tune that leaves the vision tower alone can
+reuse it. Register the folder with `"xclbin_folder": "Qwen3.8-27B-NPU2"` and
+`"details": {"family": "qwen3.8-mtp", ...}` (copy the official entry).
+
+### Checking a conversion
+
+`tools/compare_q4nx.py` decodes two `model.q4nx` files and compares every tensor
+(name, dtype, packed shape, cosine after decoding q4k/q8nx/q4_1/q4_0):
+
+```bash
+python tools/compare_q4nx.py Qwen3.8-27B-<finetune>-NPU2/model.q4nx Qwen3.8-27B-NPU2/model.q4nx
+```
+
+For a fine-tune of the same base, every tensor should be present with the same layout
+and a cosine of about 0.99 or more. A wrong head order gives about 0.
+
+`python tests/test_q4k.py` runs the synthetic self-tests for the q4_k path.
 
 ## Project Structure
 - `convert.py`: The main CLI script for running conversions.

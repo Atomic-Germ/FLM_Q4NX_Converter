@@ -87,7 +87,7 @@ FAMILY_PROFILES: Tuple[FamilyProfile, ...] = (
         field_prefixes=("qwen35.",),
         notes="Dense linear-attention Qwen3.5 (0.8B/2B/4B/9B). ssm_* tensors "
         "and fused attn_qkv. Variant resolved from qwen35.embedding_length: "
-        "1536/2304/2560/4096.",
+        "1536/2304/2560/4096 (5120 = Qwen3.8-27B, MTP kept).",
     ),
     FamilyProfile(
         arch=ModelArch.GPT_OSS,
@@ -219,6 +219,7 @@ def _is_dense_qwen35_arch(arch: ModelArch) -> bool:
     return arch in (
         ModelArch.QWEN35_08B, ModelArch.QWEN35_2B,
         ModelArch.QWEN35_4B, ModelArch.QWEN35_9B,
+        ModelArch.QWEN38_27B,
     )
 
 
@@ -249,7 +250,7 @@ def _resolve_qwen35_variant(reader: GGUFReader) -> Tuple[ModelArch, List[str]]:
     field = reader.fields.get("qwen35.embedding_length")
     if field is None:
         return ModelArch.QWEN35_2B, [
-            "qwen35.embedding_length missing -> cannot pick 0.8B/2B/4B/9B; "
+            "qwen35.embedding_length missing -> cannot pick 0.8B/2B/4B/9B/27B; "
             "defaulting to 2B (use -f to force the size)"
         ]
     try:
@@ -482,6 +483,7 @@ ARCH_TO_FAMILY: Dict[ModelArch, str] = {
     ModelArch.QWEN35_2B: "qwen3.5",
     ModelArch.QWEN35_4B: "qwen3.5",
     ModelArch.QWEN35_9B: "qwen3.5",
+    ModelArch.QWEN38_27B: "qwen3.8-mtp",
     ModelArch.QWEN35MOE: "qwen3.6-moe",
     ModelArch.QWEN3: "qwen3",
     ModelArch.QWEN3VL: "qwen3vl",

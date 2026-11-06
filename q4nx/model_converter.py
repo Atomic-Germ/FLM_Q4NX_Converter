@@ -7,6 +7,7 @@ from .constants import ModelArchConfigs
 from .constants import QWEN35_VARIANT_DIMS
 from .arch_detect import detect_model_family, resolve_override_arch
 from .gguf_tensor import GGUFTensor, GGMLQuantizationType
+from .q4k import pack_q4k
 from typing import List, Dict, Type
 import os
 import json
@@ -115,6 +116,8 @@ class __Q4NX_Converter(ABC):
             self.default_tensor_type = GGMLQuantizationType.Q4_1
         elif self.q4nx_config["default_tensor_type"] == "Q8_0":
             self.default_tensor_type = GGMLQuantizationType.Q8_0
+        elif self.q4nx_config["default_tensor_type"] == "Q4_K":
+            self.default_tensor_type = GGMLQuantizationType.Q4_K
         else:
             raise ValueError("Unsupported default_tensor_type in config")
         
@@ -140,6 +143,8 @@ class __Q4NX_Converter(ABC):
             return GGMLQuantizationType.Q4_1
         elif q4nx_name == "Q8_0":
             return GGMLQuantizationType.Q8_0
+        elif q4nx_name == "Q4_K":
+            return GGMLQuantizationType.Q4_K
         elif q4nx_name == "BF16":
             return GGMLQuantizationType.BF16
         else:
@@ -500,6 +505,11 @@ class __Q4NX_Converter(ABC):
             # array. This matches the official Q8_0-packed tensors (alpha/beta/
             # out_proj/lm_head) which use 8704-byte chunks (256 blocks x 34).
             return self._pack_q8nx(data=qw, scales=d, m=None)
+        elif tensor_type == GGMLQuantizationType.Q4_K:
+            # FLM q4_k: (t, u, q) triple from q4nx.q4k, 4736-byte chunks
+            return pack_q4k(d, m, qw, row_block_size=self.row_block_size,
+                            col_block_size=self.col_block_size,
+                            keep_block_in_2D=self.keep_block_in_2D)
         else:
             return self._pack_q4nx(d, m, qw)
         

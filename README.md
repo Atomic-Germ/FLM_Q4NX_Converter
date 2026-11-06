@@ -24,17 +24,42 @@ Based on the configuration, the converter supports several model architectures, 
 
 ## Setup
 
-Create a virtual environment using python 3.13
+Works on Linux and Windows. Python 3.12+ is recommended.
 
-1. Create and activate a virtual environment using pip or uv:
+1. Create and activate a virtual environment (uv or plain `python -m venv`):
    ```bash
+   # Linux
    uv venv venv
-   venv/bin/activate
+   source venv/bin/activate
    ```
-2. Install dependencies (one time)
+   ```powershell
+   # Windows (PowerShell)
+   uv venv venv
+   .\venv\Scripts\Activate.ps1
+   ```
+2. Install dependencies (one time):
    ```bash
-   uv pip install -r requirements.txt
+   uv pip install -r requirements.txt          # everything (HF-safetensors sources, verifiers)
+   uv pip install -r requirements-convert.txt  # or: just GGUF -> Q4NX conversion and --deploy
    ```
+   On a machine without a CUDA GPU, the CPU build of torch is enough and much smaller:
+   `uv pip install --index-url https://download.pytorch.org/whl/cpu torch` first.
+
+### Where FLM keeps things (used by `--deploy` and `flm-add.py`)
+
+| | Linux | Windows |
+|---|---|---|
+| FLM install (`model_list.json`, `xclbins/`) | `/opt/fastflowlm/share/flm` (or next to `flm` on PATH) | `%ProgramFiles%\flm` (the installer does not add it to PATH) |
+| user root (`models/`), `FLM_MODEL_PATH` overrides | `~/.config/flm` | `%USERPROFILE%\.flm` |
+| user registry written by the tools | `~/.config/flm/model_list.json` | `%USERPROFILE%\.flm\model_list.json` |
+| kernels for a custom model | symlink in `~/.config/flm/xclbins/` + `FLM_XCLBIN_PATH` | `"xclbin_folder"` in the entry (FLM 1.0.12+), else a directory junction (no admin rights needed) |
+| make FLM read the registry | `export FLM_CONFIG_PATH=...` in `~/.bashrc` | `setx FLM_CONFIG_PATH "..."` (new terminals) |
+
+Both tools accept a hardlink option (`convert.py --deploy-hardlink`, `flm-add.py --hardlink`) to put a model
+into FLM's models folder without a second multi-GB copy (same drive only).
+
+> Do not add custom models to `model_info.json` with the official file hashes and then run `flm check`:
+> FLM treats a hash mismatch as a corrupt download and deletes the file.
 
 ## Usage
 
@@ -514,8 +539,10 @@ flm serve qwen3vl-it:4b-custom
 
 ## Project Structure
 - `convert.py`: The main CLI script for running conversions.
-- `setup_venv.sh`: Initializes the Python virtual environment and installs dependencies.
-- `activate.sh`: Activates the virtual environment and sets up environment variables.
+- `requirements.txt` / `requirements-convert.txt`: full and minimal dependency sets.
+- `flm-add.py`: standalone (stdlib-only) installer for pre-converted models.
+- `q4nx/flm_paths.py`: FLM install/user paths and link helpers for Linux and Windows.
+- `tests/`: `python tests/test_install_paths.py` checks install paths and links on the current OS.
 - `q4nx/`: Core package containing the conversion logic, gguf tensor parsing, and model-specific implementations.
 - `configs/`: JSON configuration files for supported model architectures.
 

@@ -15,8 +15,12 @@ qwen3.5-claude:9b); override with --tag. Defaults for the registry entry
 FastFlowLM entry.
 
 The script never rewrites the system model list or the system xclbins; it
-writes a user-level registry at ~/.config/flm/model_list.json and adds a single
-symlink into ~/.config/flm/xclbins/ for the new model directory. Custom FLM
+writes a user-level registry at ~/.config/flm/model_list.json (Windows:
+%USERPROFILE%\\.flm\\model_list.json) and adds a single symlink into
+~/.config/flm/xclbins/ for the new model directory. When the installed FLM
+supports "xclbin_folder" entries (FLM 1.0.12 does), a Windows install points the
+entry at the official model's kernels instead of linking; otherwise Windows uses
+a directory junction (no admin rights needed). Linux behaviour is unchanged. Custom FLM
 models never ship xclbins (they are closed source), so the kernel symlink is
 always taken from the matching official model, keyed by family (engine) and
 size -- e.g. Darwin-36B-Opus-NPU2 -> Qwen3.6-35B-A3B-NPU2. The only thing
@@ -24,6 +28,13 @@ you need in your shell rc afterwards is:
 
     export FLM_CONFIG_PATH="$HOME/.config/flm/model_list.json"
     export FLM_XCLBIN_PATH="$HOME/.config/flm"
+
+On Windows (PowerShell; setx makes it permanent for new terminals):
+
+    setx FLM_CONFIG_PATH "$env:USERPROFILE\\.flm\\model_list.json"
+
+Never add a custom model to model_info.json with the official hashes: `flm check`
+deletes files whose hash does not match.
 """
 
 import argparse
@@ -52,10 +63,116 @@ SYSTEM_XCLBIN_PREFIXES = [
     Path("/usr/local/share/flm"),
 ]
 
+
+# ------------------------------------------------------------- platform paths
+# Kept in step with q4nx/flm_paths.py (this script is stdlib-only and standalone).
+
+IS_WINDOWS = os.name == "nt"
+
+
+def find_flm_exe():
+    """`flm` on PATH, else the Windows installer location (it is not put on PATH)."""
+    exe = shutil.which("flm")
+    if exe:
+        return exe
+    if IS_WINDOWS:
+        for base in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles"), r"C:\Program Files"):
+            if base and (Path(base) / "flm" / "flm.exe").is_file():
+                return str(Path(base) / "flm" / "flm.exe")
+    return None
+
+
+def user_flm_root():
+    """Directory that holds models/ (FLM_MODEL_PATH semantics)."""
+    env = os.environ.get("FLM_MODEL_PATH")
+    if env:
+        return Path(env)
+    return Path.home() / (".flm" if IS_WINDOWS else ".config/flm")
+
+
+def user_config_root():
+    """Default home of the user registry and xclbins tree (independent of
+    FLM_MODEL_PATH, as before): ~/.config/flm on Linux, %USERPROFILE%/.flm on Windows."""
+    return Path.home() / (".flm" if IS_WINDOWS else ".config/flm")
+
+
+def is_dir_link(path):
+    path = Path(path)
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)          # Python 3.12+
+    if is_junction is not None:
+        return is_junction()
+    if IS_WINDOWS and path.exists():
+        try:
+            os.readlink(path)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _norm(p):
+    p = str(p)
+    for prefix in ("\\\\?\\", "\\??\\"):    # junction targets can read back as \\?\C:\... or \??\C:\...
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+    return os.path.normcase(os.path.normpath(p))
+
+
+def remove_dir_link(path):
+    """Remove a symlink/junction itself, never what it points to."""
+    if not is_dir_link(path):
+        raise SystemExit(f"{path} is not a link; refusing to remove it")
+    if Path(path).is_symlink() and not IS_WINDOWS:
+        Path(path).unlink()
+    else:
+        os.rmdir(path)
+
+
+def link_dir(target, link):
+    """Symlink link -> target; on Windows fall back to a junction (no admin needed)."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return "symlink"
+    except OSError:
+        if not IS_WINDOWS:
+            raise
+    import _winapi
+    _winapi.CreateJunction(str(target), str(link))
+    return "junction"
+
+
+def place_file(src, dst, hardlink=False):
+    if hardlink:
+        try:
+            os.link(src, dst)
+            return "hardlink"
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+    return "copy"
+
+
+def registry_supports_xclbin_folder(registry):
+    for bucket in registry.get("models", {}).values():
+        if isinstance(bucket, dict):
+            for entry in bucket.values():
+                if isinstance(entry, dict) and "xclbin_folder" in entry:
+                    return True
+    return False
+
+
+def env_hint(name, value):
+    if IS_WINDOWS:
+        return f'setx {name} "{value}"        (this PowerShell session: $env:{name} = "{value}")'
+    return f'export {name}="{value}"        (add to ~/.bashrc)'
+
 # Dir-name prefix -> runtime details.family, used only when no official entry
 # can be matched by name. The official model_list.json is the primary source.
 FAMILY_ALIASES = [
     ("qwen3.5-omni", "qwen3.5-omni"),
+    ("qwen3.8", "qwen3.8-mtp"),
     ("qwen3.6", "qwen3.6-moe"),
     ("qwen3.5", "qwen3.5"),
     ("qwen3", "qwen3"),
@@ -101,7 +218,7 @@ def save_json(path, data):
 
 
 def find_system_model_list():
-    exe = shutil.which("flm")
+    exe = find_flm_exe()
     candidates = []
     if exe:
         candidates.append(Path(exe).parent / "model_list.json")
@@ -110,14 +227,14 @@ def find_system_model_list():
         if c.is_file():
             return c
     raise SystemExit(
-        "Could not locate the system model_list.json (looked next to `flm` and in "
-        "/opt,/usr,/usr/local share/flm). Pass --system-list."
+        "Could not locate the system model_list.json (looked next to `flm`, in "
+        "%ProgramFiles%/flm and in /opt,/usr,/usr/local share/flm). Pass --system-list."
     )
 
 
 def find_system_xclbin_root():
     """Directory whose <root>/xclbins/ holds the per-model kernel folders."""
-    exe = shutil.which("flm")
+    exe = find_flm_exe()
     candidates = []
     if exe:
         candidates.append(Path(exe).parent)
@@ -135,7 +252,7 @@ def user_xclbin_dir(arg):
         base = Path(arg)
     else:
         env = os.environ.get("FLM_XCLBIN_PATH")
-        base = Path(env) if env else Path.home() / ".config" / "flm"
+        base = Path(env) if env else user_config_root()
     return base if base.name == "xclbins" else base / "xclbins"
 
 
@@ -145,16 +262,13 @@ def user_registry_path(arg):
     env = os.environ.get("FLM_CONFIG_PATH")
     if env:
         return Path(env)
-    return Path.home() / ".config" / "flm" / "model_list.json"
+    return user_config_root() / "model_list.json"
 
 
 def models_root_dir(arg):
     if arg:
         return Path(arg)
-    env = os.environ.get("FLM_MODEL_PATH")
-    if env:
-        return Path(env) / "models"
-    return Path.home() / ".config" / "flm" / "models"
+    return user_flm_root() / "models"
 
 
 # ---------------------------------------------------------------- tag derivation
@@ -429,7 +543,7 @@ def fetch_assets(repo_id, target, modelscope=False, verify=True, force=False, qu
     return obtained
 
 
-def copy_from_dir(src_dir, target, force=False):
+def copy_from_dir(src_dir, target, force=False, hardlink=False):
     obtained = []
     for fname in ALL_FILES:
         src = src_dir / fname
@@ -438,7 +552,10 @@ def copy_from_dir(src_dir, target, force=False):
             if dest.is_file() and not force:
                 obtained.append(fname)
                 continue
-            shutil.copy2(src, dest)
+            if dest.is_file():
+                dest.unlink()
+            if place_file(src, dest, hardlink) == "copy" and hardlink:
+                log(f"[WARN] Could not hardlink {fname} (different volume?); copied it instead")
             obtained.append(fname)
     return obtained
 
@@ -514,12 +631,16 @@ def link_xclbins(system_root, user_root, dir_name, source_name, force=False, qui
     user_root.mkdir(parents=True, exist_ok=True)
     link = user_root / dir_name
     target = str(src)
-    if link.is_symlink():
-        if os.readlink(link) == target:
+    if is_dir_link(link):
+        try:
+            current = _norm(os.readlink(link))
+        except OSError:
+            current = None
+        if current == _norm(target):
             if not quiet:
                 log(f"[INFO] xclbins link already in place: {link}")
             return
-        link.unlink()
+        remove_dir_link(link)
     elif link.exists():
         if force:
             shutil.rmtree(link)
@@ -527,9 +648,9 @@ def link_xclbins(system_root, user_root, dir_name, source_name, force=False, qui
             raise SystemExit(
                 f"{link} already exists and is not a symlink. Remove it or pass --force."
             )
-    os.symlink(target, link)
+    kind = link_dir(target, link)
     if not quiet:
-        log(f"[INFO] Linked xclbins: {link} -> {target}")
+        log(f"[INFO] Linked xclbins ({kind}): {link} -> {target}")
 
 
 # ---------------------------------------------------------------------- main
@@ -542,9 +663,10 @@ def main():
     ap.add_argument("repo", help="Hugging Face repo id (Org/Name), ModelScope id (with --modelscope), URL, or local directory")
     ap.add_argument("--tag", help="Registry tag (default: derived from the repo name, e.g. qwen3.5-claude:9b)")
     ap.add_argument("--family", help="details.family for engine dispatch (default: from matching official entry)")
-    ap.add_argument("--config", help="model_list.json to update (default: $FLM_CONFIG_PATH or ~/.config/flm/model_list.json)")
-    ap.add_argument("--models-root", help="models directory (default: $FLM_MODEL_PATH or ~/.config/flm/models)")
-    ap.add_argument("--xclbin-dir", help="user xclbins directory (default: ~/.config/flm/xclbins)")
+    ap.add_argument("--config", help="model_list.json to update (default: $FLM_CONFIG_PATH, else ~/.config/flm/model_list.json; Windows: %%USERPROFILE%%/.flm/model_list.json)")
+    ap.add_argument("--models-root", help="models directory (default: $FLM_MODEL_PATH/models, else ~/.config/flm/models; Windows: %%USERPROFILE%%/.flm/models)")
+    ap.add_argument("--xclbin-dir", help="user xclbins directory (default: <user flm root>/xclbins)")
+    ap.add_argument("--hardlink", action="store_true", help="For a local directory: hardlink the files instead of copying (same volume only)")
     ap.add_argument("--xclbin-from", help="official model directory name to link xclbins from (default: best match, e.g. Qwen3.6-35B-A3B-NPU2)")
     ap.add_argument("--system-list", help="official model_list.json used for defaults (default: auto-detect)")
     ap.add_argument("--modelscope", action="store_true", help="Treat REPO as a ModelScope repo id")
@@ -601,7 +723,7 @@ def main():
         if not args.quiet:
             log(f"[INFO] Using local model directory: {local_dir}")
         target.mkdir(parents=True, exist_ok=True)
-        files = copy_from_dir(local_dir, target, force=args.force)
+        files = copy_from_dir(local_dir, target, force=args.force, hardlink=args.hardlink)
     else:
         snapshot = None if args.modelscope else hf_cache_snapshot(repo)
         if snapshot:
@@ -623,11 +745,19 @@ def main():
         size_value = estimate_size(target / "config.json")
     entry = build_entry(base_entry, dir_name, files, size_value)
     entry.setdefault("details", {})["family"] = family
+    # Windows only: symlinks there need admin rights, and FLM 1.0.12+ can point an
+    # entry at another model's kernel folder instead. Linux keeps the symlink flow.
+    use_xclbin_folder = (IS_WINDOWS and bool(xclbin_source) and not args.no_xclbin
+                         and registry_supports_xclbin_folder(system_registry))
+    if use_xclbin_folder:
+        entry["xclbin_folder"] = (base_entry or {}).get("xclbin_folder", xclbin_source)
 
     register(user_list, tag, entry, system_registry)
     log(f"[INFO] Registered tag '{tag}' in {user_list}")
 
-    if not args.no_xclbin:
+    if use_xclbin_folder:
+        log(f"[INFO] Kernels: reusing '{entry['xclbin_folder']}' via xclbin_folder")
+    if not args.no_xclbin and not use_xclbin_folder:
         system_root = find_system_xclbin_root()
         if system_root is None:
             log("[WARN] Could not locate system xclbins; skipped symlink.")
@@ -645,9 +775,10 @@ def main():
     print(f"Done: {dir_name} installed to {target}")
     print(f"Run:  flm run {tag}   (or: flm serve {tag})")
     print()
-    print("Make sure your shell has these exports (add to ~/.bashrc):")
-    print('    export FLM_CONFIG_PATH="$HOME/.config/flm/model_list.json"')
-    print('    export FLM_XCLBIN_PATH="$HOME/.config/flm"')
+    print("Make sure FLM reads this registry:")
+    print("    " + env_hint("FLM_CONFIG_PATH", user_list))
+    if not use_xclbin_folder:
+        print("    " + env_hint("FLM_XCLBIN_PATH", user_xclbin_dir(args.xclbin_dir).parent))
 
 
 if __name__ == "__main__":

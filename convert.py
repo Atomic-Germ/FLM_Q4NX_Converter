@@ -37,7 +37,7 @@ def is_hf_source(path: str) -> bool:
     return is_hf_repo_id(path)
 
 
-def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None):
+def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str, weights_type: str = 'language', source_model: str = None, flm_version: str = None, deploy_tag: str = None, deploy_from: str = None, deploy_name: str = None, deploy_hardlink: bool = False):
     if flm_version is None:
         flm_version = get_default_flm_version()
     # The weight source is always -i: an HF dir / repo id (Darwin-style HF
@@ -94,6 +94,7 @@ def convert_gguf_to_q4nx(gguf_path: str, q4nx_path: str, override_model_arch:str
             model.model_arch,
             model_dir_name=deploy_name,
             deploy_from=deploy_from,
+            hardlink=deploy_hardlink,
         )
     return model
 
@@ -131,6 +132,8 @@ def main():
                         help="Deploy the converted model into flm's models directory and register it under this tag (e.g. 'qwen3.5-claude:9b'). Uses a user-level model_list.json (point FLM_CONFIG_PATH at it to make `flm run` see the tag).")
     parser.add_argument('--deploy-from', dest='deploy_from', default=None, metavar='SOURCE_TAG',
                         help="Official registry entry to copy defaults from (e.g. 'qwen3.5:9b'). Auto-detected from the model architecture if omitted.")
+    parser.add_argument('--deploy-hardlink', dest='deploy_hardlink', action='store_true',
+                        help="With --deploy: hardlink the files into flm's models dir instead of copying (same volume only; no second copy on disk).")
     parser.add_argument('--deploy-name', dest='deploy_name', default=None, metavar='DIR',
                         help="Directory name inside flm's models dir (default: derived from the deploy tag, e.g. Qwen3.5-Claude-9B-NPU2).")
     
@@ -155,7 +158,7 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
     
     print(f"[INFO] Converting {input_path} to {output_folder}...")
-    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, flm_version=args.flm_version, deploy_tag=args.deploy_tag, deploy_from=args.deploy_from, deploy_name=args.deploy_name)
+    convert_gguf_to_q4nx(input_path, output_folder, args.force_model_type, weights_type=args.weights_type, source_model=args.source_model, flm_version=args.flm_version, deploy_tag=args.deploy_tag, deploy_from=args.deploy_from, deploy_name=args.deploy_name, deploy_hardlink=args.deploy_hardlink)
     print(f"[INFO] Conversion complete! Output saved to {output_folder}")
 
 
